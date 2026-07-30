@@ -1,0 +1,8 @@
+.git
+.env
+.venv
+.opik-migrate
+.pytest_cache
+.ruff_cache
+__pycache__
+dist

@@ -1,0 +1,1 @@
+uv add "braintrust[openai] @ git+https://github.com/braintrustdata/braintrust-sdk-python.git@abhi-harbor-integration#subdirectory=py"
