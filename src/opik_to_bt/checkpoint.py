@@ -12,12 +12,14 @@ class Checkpoint:
             "completed": [],
             "targets": {},
             "cursors": {},
+            "offsets": {},
             "page_sizes": {},
             "values": {},
         }
         if resume and path.exists():
             self.data = json.loads(path.read_text())
             self.data.setdefault("cursors", {})
+            self.data.setdefault("offsets", {})
             self.data.setdefault("page_sizes", {})
             self.data.setdefault("values", {})
 
@@ -41,6 +43,15 @@ class Checkpoint:
 
     def set_cursor(self, key: str, next_page: int) -> None:
         self.data["cursors"][key] = next_page
+        self.data["offsets"][key] = 0
+        self.save()
+
+    def offset(self, key: str) -> int:
+        return int(self.data["offsets"].get(key, 0))
+
+    def set_position(self, key: str, next_page: int, next_offset: int) -> None:
+        self.data["cursors"][key] = next_page
+        self.data["offsets"][key] = next_offset
         self.save()
 
     def bind_page_size(self, key: str, page_size: int) -> None:

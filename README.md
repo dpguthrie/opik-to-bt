@@ -23,13 +23,16 @@ The migrator does not download a complete resource before uploading it. It
 operates as a bounded pipeline:
 
 ```text
-Opik pages → transform → immutable partition → bt sync → checkpoint
+Opik pages → incremental transform/staging → bt sync → checkpoint
 ```
 
-Extraction and upload overlap. Independent projects, datasets, and experiments
-run concurrently, while bounded queues prevent memory or disk usage from
-growing with the total migration size. Dataset migrations complete before
-dependent experiments.
+Extraction and upload overlap. Each transformed event is serialized once into
+a rolling NDJSON staging file; the file rotates at the partition target even in
+the middle of a large Opik page. Ready partitions live on staging disk rather
+than in memory while they wait for `bt sync`. Independent projects, datasets,
+and experiments run concurrently, while bounded queues prevent memory or disk
+usage from growing with the total migration size. Dataset migrations complete
+before dependent experiments.
 
 Opik traces and spans are separate resources. The migrator paginates each
 project-wide endpoint in bulk: each trace page becomes a bounded chunk, then one
@@ -56,7 +59,7 @@ into this display; full output is retained in the error if a push fails.
 Each immutable partition has:
 
 - stable Braintrust event IDs;
-- a durable source-page cursor;
+- a durable source-page and in-page event cursor;
 - independent `bt sync` state;
 - bounded retry and upload behavior.
 
@@ -67,7 +70,8 @@ continuing automatically.
 
 After a successful `bt sync` upload, the temporary NDJSON partition is removed.
 Checkpoint and `bt sync` state remain under `.opik-to-bt/`. An interrupted run
-restarts at the last uploaded source page rather than the beginning.
+restarts after the last uploaded event, including when that position is in the
+middle of an Opik page.
 
 All uploads go through
 [`bt sync`](https://www.braintrust.dev/docs/reference/cli/sync), which provides
@@ -239,10 +243,10 @@ from the runner's CPU, memory, and free staging disk.
 |---|---:|---|
 | `OPIK_TO_BT_TIMEOUT_SECONDS` | `60` | Per-request Opik HTTP timeout in seconds. Must be greater than zero. |
 | `OPIK_TO_BT_RETRY_ATTEMPTS` | `8` | Maximum total attempts for a retryable Opik request. The shared request gate honors server reset headers and applies bounded exponential backoff with jitter. |
-| `OPIK_TO_BT_PAGE_SIZE` | `2000` | Opik records requested per page (`1`–`2000`). The maximum minimizes API requests. Lower it when individual records are large or the runner is memory-constrained; a single page is the minimum in-memory transformation unit. Do not change it after a stream has checkpointed beyond page 1 unless starting fresh. |
-| `OPIK_TO_BT_PARTITION_BYTES` | Automatic, up to `256 MiB` | Target uncompressed NDJSON bytes per immutable `bt sync` partition; override values are specified in bytes. The automatic value is bounded by memory and free disk; the effective minimum is `16 MiB`. A single Opik page may exceed the target. |
+| `OPIK_TO_BT_PAGE_SIZE` | `2000` | Opik records requested per page (`1`–`2000`). The maximum minimizes API requests. Lower it only when the source response objects themselves are too large for the runner; transformed events are staged incrementally. Do not change it after a stream has checkpointed beyond page 1 unless starting fresh. |
+| `OPIK_TO_BT_PARTITION_BYTES` | Automatic, up to `256 MiB` | Target uncompressed NDJSON bytes per immutable `bt sync` partition; override values are specified in bytes. The automatic value is bounded by memory and free disk; the effective minimum is `16 MiB`. Partitions rotate between events, so only a single event larger than the target can produce an oversized partition. |
 | `OPIK_TO_BT_RESOURCE_WORKERS` | `min(8, max(2, CPU/2))` | Maximum concurrent resource jobs and Opik request slots (`1`–`64`). Higher values improve extraction concurrency but increase API pressure and memory use. |
-| `OPIK_TO_BT_BUFFERED_PARTITIONS` | `2` | Ready-to-upload partitions buffered per active stream (`1`–`8`). Higher values allow more extraction/upload overlap at the cost of memory and staging disk. |
+| `OPIK_TO_BT_BUFFERED_PARTITIONS` | `2` | Ready-to-upload partition files buffered per active stream (`1`–`8`). Higher values allow more extraction/upload overlap at the cost of staging disk; partition contents are not held in memory. |
 | `OPIK_TO_BT_UPLOAD_PROCESSES` | `min(2, max(1, CPU/4))` | Concurrent `bt sync` subprocesses across the migration (`1`–`16`). |
 | `OPIK_TO_BT_BT_WORKERS` | `min(16, max(2, CPU/upload processes))` | Parallel workers passed to each `bt sync push` process (`1`–`64`). Approximate maximum upload concurrency is upload processes multiplied by these workers. |
 
@@ -258,3 +262,6 @@ uv run ruff format --check .
 uv run pytest
 uv build
 ```
+
+The repeatable synthetic partition benchmark and the latest before/after
+results are documented in [`benchmarks/README.md`](benchmarks/README.md).

@@ -7,7 +7,6 @@ import json
 import os
 import shutil
 from pathlib import Path
-from typing import Any
 
 from opik_to_bt.config import Settings
 from opik_to_bt.tuning import RuntimeTuning
@@ -58,29 +57,29 @@ class BtSyncTarget:
     async def insert_dataset(
         self,
         dataset_id: str,
-        events: list[dict[str, Any]],
+        path: Path,
         *,
         partition_key: str | None = None,
     ) -> None:
-        await self._push(dataset_id, events, partition_key)
+        await self._push(dataset_id, path, partition_key)
 
     async def insert_experiment(
         self,
         experiment_id: str,
-        events: list[dict[str, Any]],
+        path: Path,
         *,
         partition_key: str | None = None,
     ) -> None:
-        await self._push(experiment_id, events, partition_key)
+        await self._push(experiment_id, path, partition_key)
 
     async def insert_logs(
         self,
         project_id: str,
-        events: list[dict[str, Any]],
+        path: Path,
         *,
         partition_key: str | None = None,
     ) -> None:
-        await self._push(project_id, events, partition_key)
+        await self._push(project_id, path, partition_key)
 
     def _handle(self, kind: str, project: str, name: str) -> str:
         payload = json.dumps([kind, project, name], separators=(",", ":")).encode()
@@ -94,7 +93,7 @@ class BtSyncTarget:
     async def _push(
         self,
         handle: str,
-        events: list[dict[str, Any]],
+        source_path: Path,
         partition_key: str | None,
     ) -> None:
         kind, project, name = self._decode(handle)
@@ -104,7 +103,7 @@ class BtSyncTarget:
         path = self.stage_dir / f"{digest}.ndjson"
 
         async with self.upload_slots:
-            await asyncio.to_thread(self._write_partition, path, events)
+            await asyncio.to_thread(source_path.replace, path)
             environment = os.environ.copy()
             if self.api_key:
                 environment["BRAINTRUST_API_KEY"] = self.api_key
@@ -142,11 +141,3 @@ class BtSyncTarget:
                 + (f":\n{details}" if details else "")
             )
         path.unlink(missing_ok=True)
-
-    @staticmethod
-    def _write_partition(path: Path, events: list[dict[str, Any]]) -> None:
-        temporary = path.with_suffix(".tmp")
-        with temporary.open("w") as output:
-            for event in events:
-                output.write(json.dumps(event, separators=(",", ":"), ensure_ascii=False) + "\n")
-        temporary.replace(path)
