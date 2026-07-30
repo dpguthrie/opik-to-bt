@@ -29,7 +29,20 @@ class FakeSource:
         ]
 
     async def experiment_items(self, experiment_id):
-        return [{"id": "result", "dataset_item_id": "row"}]
+        return [
+            {
+                "id": "result",
+                "dataset_item_id": "row",
+                "assertion_results": [
+                    {
+                        "value": "Useful",
+                        "passed": True,
+                        "reason": "The answer is useful.",
+                    }
+                ],
+                "status": "passed",
+            }
+        ]
 
     async def traces(self, project_name, *, start, end):
         return []
@@ -77,8 +90,17 @@ async def test_migrator_filters_and_checkpoints(tmp_path) -> None:
     await migrator.run(selection)
 
     assert len(target.datasets) == 1
-    assert len(target.experiments) == 1
+    assert len(target.experiments) == 3
     assert target.experiments[0]["id"] == "opik:experiment-item:result"
+    assert target.experiments[1]["_object_delete"] is True
+    assert target.experiments[2]["scores"] == {"Test suite passed": 1.0}
+    assert target.experiments[2]["metadata"]["assertions"] == [
+        {
+            "text": "Useful",
+            "passed": True,
+            "reason": "The answer is useful.",
+        }
+    ]
 
 
 async def test_logs_use_independent_bulk_trace_and_span_pagination(
@@ -93,7 +115,12 @@ async def test_logs_use_independent_bulk_trace_and_span_pagination(
             yield Page(
                 1,
                 [
-                    {"id": "inside", "start_time": "2026-01-31T23:59:59Z"},
+                    {
+                        "id": "inside",
+                        "start_time": "2026-01-31T23:59:59Z",
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 2},
+                        "total_estimated_cost": 0.02,
+                    },
                     {"id": "at-end", "start_time": "2026-02-01T00:00:00Z"},
                 ],
                 2,
@@ -115,6 +142,8 @@ async def test_logs_use_independent_bulk_trace_and_span_pagination(
                         "id": "span-inside",
                         "trace_id": "inside",
                         "start_time": "2026-01-31T23:59:59Z",
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 2},
+                        "total_estimated_cost": 0.02,
                     },
                     {
                         "id": "span-at-end",
@@ -155,6 +184,15 @@ async def test_logs_use_independent_bulk_trace_and_span_pagination(
         "opik:trace:inside",
         "opik:span:span-inside",
     }
+    root = next(event for event in target.events if event["is_root"])
+    span = next(event for event in target.events if not event["is_root"])
+    assert "prompt_tokens" not in root["metrics"]
+    assert "estimated_cost" not in root["metrics"]
+    assert root["metadata"]["opik"]["aggregate_usage"]["prompt_tokens"] == 10
+    assert span["metrics"]["prompt_tokens"] == 10
+    assert span["metrics"]["completion_tokens"] == 2
+    assert span["metrics"]["tokens"] == 12
+    assert span["metrics"]["estimated_cost"] == 0.02
     assert source.calls == [
         ("traces", "project", selection.start, selection.end, 1),
         ("spans", "project", {"inside"}, selection.start, selection.end),

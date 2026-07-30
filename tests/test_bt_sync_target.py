@@ -47,6 +47,7 @@ async def test_each_partition_gets_independent_bt_sync_state(tmp_path, monkeypat
         tmp_path,
         settings(),
         RuntimeTuning.conservative(),
+        fresh=True,
     )
     dataset = target._handle("dataset", "project", "dataset")
 
@@ -57,6 +58,7 @@ async def test_each_partition_gets_independent_bt_sync_state(tmp_path, monkeypat
     assert len(commands) == 2
     assert len(set(roots)) == 2
     assert all("--no-input" in command for command in commands)
+    assert all("--fresh" in command for command in commands)
     assert all(env["BRAINTRUST_API_KEY"] == "test-key" for env in environments)
     assert all(env is not None for env in environments)
     assert list(target.stage_dir.glob("*.ndjson")) == []

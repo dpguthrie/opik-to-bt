@@ -69,7 +69,7 @@ def main(
 
 async def _run(settings: Settings, selection: Selection, state_dir: Path, resume: bool) -> None:
     tuning = RuntimeTuning.detect(state_dir, settings)
-    target = BtSyncTarget(state_dir, settings, tuning)
+    target = BtSyncTarget(state_dir, settings, tuning, fresh=not resume)
     checkpoint = Checkpoint(state_dir / "checkpoint.json", resume=resume)
     typer.echo(
         "Runtime: automatic "

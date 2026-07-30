@@ -119,7 +119,8 @@ uv run opik-to-bt \
 
 No performance flags are required. Keep `.opik-to-bt/` when moving or
 restarting the job. Use `--no-resume` only when intentionally ignoring importer
-completion markers; stable IDs and `bt sync` state still make replay safe.
+completion markers. This also starts fresh `bt sync` upload state; stable event
+IDs make the replay overwrite-safe.
 
 ## Configuration
 
@@ -163,8 +164,30 @@ must remain on its root volume.
 - Opik trace and span relationships become Braintrust root spans and child
   spans. Opik LLM/tool/guardrail types map to Braintrust
   `llm`/`tool`/`classifier`; other spans map to `task`.
-- Experiment feedback in Braintrust's score range `[0, 1]` becomes scores.
-  Other numeric feedback is retained in metadata.
+- Opik feedback in Braintrust's score range `[0, 1]` becomes scores. Numeric
+  feedback outside that range becomes a custom metric and the original
+  feedback objects are retained under `metadata.opik`.
+- Test-suite results become one stable `Test suite passed` binary score per
+  item (`1` for passed and `0` for failed). Suite-level and item-level
+  assertions may differ by row, so assertion text is not used as a Braintrust
+  score name. The full assertion breakdown, pass count, Opik status, and
+  execution policy are retained on the scorer span metadata. Regular Opik
+  feedback remains mapped to separate Braintrust scores.
+- Experiment inputs and outputs preserve Opik's existing structured objects
+  (for example, `{"question": ...}` and `{"answer": ...}`). If an older Opik
+  response omits the explicit input object, all non-reserved dataset fields are
+  used as the Braintrust input rather than assuming particular field names.
+- Opik duration and time-to-first-token values are converted from milliseconds
+  to seconds. Trace and span end times are derived from Opik's measured duration
+  when available, avoiding open-ended Braintrust spans when Opik omits
+  `end_time`. When a trace has children, its timing uses the child-span envelope
+  so a stale reused Opik trace timestamp cannot inflate the Braintrust timeline.
+  Token usage is normalized to Braintrust's canonical metric names, and Opik's
+  estimated USD cost becomes `metrics.estimated_cost`.
+- Trace-level usage and cost are aggregates of their spans. When child spans
+  are present, only the span metrics use Braintrust's canonical names so trace
+  summaries do not double-count them; the Opik trace aggregates remain under
+  `metadata.opik`.
 - Cross-object dataset origin IDs are omitted because the destination dataset
   ID is resolved internally by `bt sync`.
 - Source identifiers and unmapped context are retained under `metadata.opik`.

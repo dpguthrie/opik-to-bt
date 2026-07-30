@@ -7,7 +7,7 @@ from typing import Any
 
 from opik_to_bt.checkpoint import Checkpoint
 from opik_to_bt.config import Resource, parse_datetime
-from opik_to_bt.mapping import dataset_event, experiment_event, span_event, trace_event
+from opik_to_bt.mapping import dataset_event, experiment_events, span_event, trace_event
 from opik_to_bt.pipeline import Page, Partition, bounded_gather, run_partitioned
 from opik_to_bt.progress import MigrationProgress
 from opik_to_bt.tuning import RuntimeTuning
@@ -238,7 +238,7 @@ class Migrator:
         partition_number = 0
 
         async def transform(items: list[Any]) -> list[dict[str, Any]]:
-            return [experiment_event(item) for item in items]
+            return [event for item in items for event in experiment_events(item)]
 
         async def upload(partition: Partition) -> None:
             nonlocal partition_number
@@ -296,7 +296,7 @@ class Migrator:
                 )
             ]
             trace_ids = {str(as_dict(trace)["id"]) for trace in traces}
-            events = [trace_event(trace) for trace in traces]
+            spans = []
             span_page = 0
             matched_spans = 0
             async for page in self.source.span_pages_for_traces(
@@ -310,12 +310,23 @@ class Migrator:
                     span for span in page.items if as_dict(span).get("trace_id") in trace_ids
                 ]
                 matched_spans += len(matched)
+                spans.extend(matched)
                 self.progress.detail(
                     task,
                     f"span page {span_page} · {matched_spans:,} matched",
                 )
-                events.extend(span_event(as_dict(span)["trace_id"], span) for span in matched)
-            return events
+            spans_by_trace: dict[str, list[Any]] = {}
+            for span in spans:
+                spans_by_trace.setdefault(str(as_dict(span)["trace_id"]), []).append(span)
+            traces_with_spans = set(spans_by_trace)
+            return [
+                trace_event(
+                    trace,
+                    include_aggregate_metrics=str(as_dict(trace)["id"]) not in traces_with_spans,
+                    spans=spans_by_trace.get(str(as_dict(trace)["id"])),
+                )
+                for trace in traces
+            ] + [span_event(as_dict(span)["trace_id"], span) for span in spans]
 
         async def upload(partition: Partition) -> None:
             nonlocal partition_number

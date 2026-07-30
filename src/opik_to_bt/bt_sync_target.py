@@ -21,6 +21,8 @@ class BtSyncTarget:
         state_dir: Path,
         settings: Settings,
         tuning: RuntimeTuning | None = None,
+        *,
+        fresh: bool = False,
     ) -> None:
         tuning = tuning or RuntimeTuning.detect(state_dir, settings)
         self.state_dir = state_dir
@@ -30,6 +32,7 @@ class BtSyncTarget:
         self.api_key = settings.braintrust_api_key
         self.upload_slots = asyncio.Semaphore(tuning.upload_processes)
         self.workers = tuning.bt_workers
+        self.fresh = fresh
 
     async def close(self) -> None:
         return None
@@ -105,7 +108,7 @@ class BtSyncTarget:
             environment = os.environ.copy()
             if self.api_key:
                 environment["BRAINTRUST_API_KEY"] = self.api_key
-            process = await asyncio.create_subprocess_exec(
+            command = [
                 "bt",
                 "sync",
                 "push",
@@ -121,6 +124,11 @@ class BtSyncTarget:
                 "--api-url",
                 self.api_url,
                 "--no-input",
+            ]
+            if self.fresh:
+                command.append("--fresh")
+            process = await asyncio.create_subprocess_exec(
+                *command,
                 env=environment,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
