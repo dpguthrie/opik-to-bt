@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Awaitable, Callable
+import tempfile
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from opik_to_bt.checkpoint import Checkpoint
@@ -20,17 +22,19 @@ class Page:
 @dataclass(frozen=True)
 class Partition:
     key: str
-    events: list[dict[str, Any]]
+    path: Path
+    event_count: int
     bytes: int
     next_page: int
+    next_offset: int
 
 
-TransformPage = Callable[[list[Any]], Awaitable[list[dict[str, Any]]]]
+TransformPage = Callable[[list[Any]], Awaitable[Iterable[dict[str, Any]]]]
 UploadPartition = Callable[[Partition], Awaitable[None]]
 
 
-def event_bytes(event: dict[str, Any]) -> int:
-    return len(json.dumps(event, separators=(",", ":"), ensure_ascii=False).encode()) + 1
+def encode_event(event: dict[str, Any]) -> bytes:
+    return json.dumps(event, separators=(",", ":"), ensure_ascii=False).encode() + b"\n"
 
 
 async def run_partitioned(
@@ -47,54 +51,106 @@ async def run_partitioned(
     totals = {"events": 0, "partitions": 0}
 
     async def produce() -> None:
-        events: list[dict[str, Any]] = []
+        output = None
+        path: Path | None = None
         size = 0
+        event_count = 0
         first_page: int | None = None
+        first_offset: int | None = None
         last_page: int | None = None
+        resume_page = checkpoint.cursor(stream_key)
+        resume_offset = checkpoint.offset(stream_key)
 
-        async def flush(next_page: int) -> None:
-            nonlocal events, size, first_page, last_page
-            if not events:
+        async def flush(next_page: int, next_offset: int) -> None:
+            nonlocal output, path, size, event_count
+            nonlocal first_page, first_offset, last_page
+            if output is None or path is None:
                 return
-            key = f"{stream_key}:pages:{first_page}-{last_page}"
-            await queue.put(Partition(key, events, size, next_page))
-            events, size, first_page, last_page = [], 0, None, None
+            output.close()
+            key = f"{stream_key}:events:{first_page}.{first_offset}-{next_page}.{next_offset}"
+            await queue.put(
+                Partition(
+                    key=key,
+                    path=path,
+                    event_count=event_count,
+                    bytes=size,
+                    next_page=next_page,
+                    next_offset=next_offset,
+                )
+            )
+            output = None
+            path = None
+            size = 0
+            event_count = 0
+            first_page = None
+            first_offset = None
+            last_page = None
 
-        async for page in pages:
-            transformed = await transform(page.items)
-            transformed_size = sum(event_bytes(event) for event in transformed)
-            if events and size + transformed_size > tuning.partition_bytes:
-                await flush(page.number)
-            if transformed:
-                first_page = page.number if first_page is None else first_page
-                last_page = page.number
-                events.extend(transformed)
-                size += transformed_size
-            # A single page may exceed the target, but memory remains bounded by page size.
-            if size >= tuning.partition_bytes:
-                await flush(page.number + 1)
-        if last_page is not None:
-            await flush(last_page + 1)
-        await queue.put(None)
+        try:
+            async for page in pages:
+                transformed = await transform(page.items)
+                offset = resume_offset if page.number == resume_page else 0
+                saw_event = False
+                for index, event in enumerate(transformed):
+                    if index < offset:
+                        continue
+                    saw_event = True
+                    encoded = encode_event(event)
+                    if output is not None and size + len(encoded) > tuning.partition_bytes:
+                        await flush(page.number, index)
+                    if output is None:
+                        temporary = tempfile.NamedTemporaryFile(  # noqa: SIM115
+                            mode="wb",
+                            buffering=1024 * 1024,
+                            dir=buffer_dir,
+                            prefix="partition-",
+                            suffix=".ndjson",
+                            delete=False,
+                        )
+                        output = temporary
+                        path = Path(temporary.name)
+                        first_page = page.number
+                        first_offset = index
+                    last_page = page.number
+                    output.write(encoded)
+                    size += len(encoded)
+                    event_count += 1
+                if saw_event and size >= tuning.partition_bytes:
+                    await flush(page.number + 1, 0)
+            if last_page is not None:
+                await flush(last_page + 1, 0)
+            await queue.put(None)
+        finally:
+            if output is not None and not output.closed:
+                output.close()
 
     async def consume() -> None:
         while partition := await queue.get():
             if not checkpoint.completed(partition.key):
                 await upload(partition)
                 checkpoint.mark_completed(partition.key)
-            checkpoint.set_cursor(stream_key, partition.next_page)
-            totals["events"] += len(partition.events)
+            partition.path.unlink(missing_ok=True)
+            checkpoint.set_position(
+                stream_key,
+                partition.next_page,
+                partition.next_offset,
+            )
+            totals["events"] += partition.event_count
             totals["partitions"] += 1
             queue.task_done()
         queue.task_done()
 
-    try:
-        async with asyncio.TaskGroup() as tasks:
-            tasks.create_task(produce())
-            tasks.create_task(consume())
-    except* Exception as errors:
-        # Keep CLI failures direct and actionable instead of exposing TaskGroup internals.
-        raise errors.exceptions[0] from None
+    buffer_root = checkpoint.path.parent / "buffers"
+    buffer_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="stream-", dir=buffer_root) as directory:
+        buffer_dir = Path(directory)
+        try:
+            async with asyncio.TaskGroup() as tasks:
+                tasks.create_task(produce())
+                tasks.create_task(consume())
+        except* Exception as errors:
+            # Keep CLI failures direct and actionable instead of exposing TaskGroup internals.
+            raise errors.exceptions[0] from None
     checkpoint.mark_completed(stream_key)
     return totals["events"], totals["partitions"]
 

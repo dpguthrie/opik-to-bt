@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -77,7 +78,7 @@ class Migrator:
     ) -> None:
         await method(
             target_id,
-            partition.events,
+            partition.path,
             partition_key=partition.key,
         )
 
@@ -170,15 +171,15 @@ class Migrator:
         task = self.progress.start(f"dataset · {raw['name']}")
         partition_number = 0
 
-        async def transform(items: list[Any]) -> list[dict[str, Any]]:
-            return [dataset_event(item) for item in items]
+        async def transform(items: list[Any]) -> Iterable[dict[str, Any]]:
+            return (dataset_event(item) for item in items)
 
         async def upload(partition: Partition) -> None:
             nonlocal partition_number
             partition_number += 1
             self.progress.uploading(
                 task,
-                events=len(partition.events),
+                events=partition.event_count,
                 partition=partition_number,
             )
             await self._upload(self.target.insert_dataset, target_id, partition)
@@ -237,15 +238,15 @@ class Migrator:
         task = self.progress.start(f"experiment · {raw['name']}")
         partition_number = 0
 
-        async def transform(items: list[Any]) -> list[dict[str, Any]]:
-            return [event for item in items for event in experiment_events(item)]
+        async def transform(items: list[Any]) -> Iterable[dict[str, Any]]:
+            return (event for item in items for event in experiment_events(item))
 
         async def upload(partition: Partition) -> None:
             nonlocal partition_number
             partition_number += 1
             self.progress.uploading(
                 task,
-                events=len(partition.events),
+                events=partition.event_count,
                 partition=partition_number,
             )
             await self._upload(self.target.insert_experiment, target_id, partition)
@@ -285,7 +286,7 @@ class Migrator:
         task = self.progress.start("logs · traces and spans")
         partition_number = 0
 
-        async def transform(traces: list[Any]) -> list[dict[str, Any]]:
+        async def transform(traces: list[Any]) -> Iterable[dict[str, Any]]:
             traces = [
                 trace
                 for trace in traces
@@ -319,21 +320,26 @@ class Migrator:
             for span in spans:
                 spans_by_trace.setdefault(str(as_dict(span)["trace_id"]), []).append(span)
             traces_with_spans = set(spans_by_trace)
-            return [
-                trace_event(
-                    trace,
-                    include_aggregate_metrics=str(as_dict(trace)["id"]) not in traces_with_spans,
-                    spans=spans_by_trace.get(str(as_dict(trace)["id"])),
-                )
-                for trace in traces
-            ] + [span_event(as_dict(span)["trace_id"], span) for span in spans]
+
+            def events() -> Any:
+                for trace in traces:
+                    trace_id = str(as_dict(trace)["id"])
+                    yield trace_event(
+                        trace,
+                        include_aggregate_metrics=trace_id not in traces_with_spans,
+                        spans=spans_by_trace.get(trace_id),
+                    )
+                for span in spans:
+                    yield span_event(as_dict(span)["trace_id"], span)
+
+            return events()
 
         async def upload(partition: Partition) -> None:
             nonlocal partition_number
             partition_number += 1
             self.progress.uploading(
                 task,
-                events=len(partition.events),
+                events=partition.event_count,
                 partition=partition_number,
             )
             await self._upload(self.target.insert_logs, target_project_id, partition)

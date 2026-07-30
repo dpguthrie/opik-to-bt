@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 import pytest
 
@@ -25,6 +26,10 @@ async def page_stream(start: int, end: int):
 
 async def transform(items):
     return items
+
+
+def partition_events(partition) -> list[dict]:
+    return [json.loads(line) for line in partition.path.read_bytes().splitlines()]
 
 
 async def test_partition_pipeline_is_bounded_and_checkpoints_pages(tmp_path) -> None:
@@ -108,6 +113,106 @@ async def test_partition_pipeline_resumes_after_failed_upload(tmp_path) -> None:
     assert len(resumed_uploads) == 2
     assert checkpoint.cursor("logs:project:window") == 4
     assert checkpoint.completed("logs:project:window")
+
+
+async def test_large_source_page_is_split_at_partition_target(tmp_path) -> None:
+    checkpoint = Checkpoint(tmp_path / "checkpoint.json")
+    uploaded_sizes = []
+    uploaded_ids = []
+    items = [{"id": index, "payload": "x" * 40} for index in range(8)]
+
+    async def pages():
+        yield Page(1, items)
+
+    async def upload(partition):
+        uploaded_sizes.append(partition.bytes)
+        uploaded_ids.extend(event["id"] for event in partition_events(partition))
+
+    events, partitions = await run_partitioned(
+        stream_key="dataset:oversized-page",
+        pages=pages(),
+        transform=transform,
+        upload=upload,
+        checkpoint=checkpoint,
+        tuning=tuning(partition_bytes=120),
+    )
+
+    assert events == len(items)
+    assert partitions > 1
+    assert all(size <= 120 for size in uploaded_sizes)
+    assert uploaded_ids == list(range(8))
+
+
+async def test_mid_page_checkpoint_resumes_without_duplicates(tmp_path) -> None:
+    checkpoint = Checkpoint(tmp_path / "checkpoint.json")
+    items = [{"id": index, "payload": "x" * 40} for index in range(8)]
+    uploaded_before_failure = []
+    attempts = 0
+
+    async def pages():
+        yield Page(1, items)
+
+    async def fail_second(partition):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 2:
+            raise RuntimeError("temporary upload failure")
+        uploaded_before_failure.extend(partition_events(partition))
+
+    with pytest.raises(RuntimeError, match="temporary upload failure"):
+        await run_partitioned(
+            stream_key="dataset:mid-page",
+            pages=pages(),
+            transform=transform,
+            upload=fail_second,
+            checkpoint=checkpoint,
+            tuning=tuning(partition_bytes=120),
+        )
+
+    assert checkpoint.cursor("dataset:mid-page") == 1
+    assert checkpoint.offset("dataset:mid-page") > 0
+
+    resumed = []
+
+    async def upload(partition):
+        resumed.extend(partition_events(partition))
+
+    await run_partitioned(
+        stream_key="dataset:mid-page",
+        pages=pages(),
+        transform=transform,
+        upload=upload,
+        checkpoint=checkpoint,
+        tuning=tuning(partition_bytes=120),
+    )
+
+    migrated_ids = [event["id"] for event in uploaded_before_failure + resumed]
+    assert migrated_ids == list(range(8))
+
+
+async def test_single_event_may_exceed_partition_target(tmp_path) -> None:
+    uploaded_sizes = []
+    uploaded_counts = []
+
+    async def pages():
+        yield Page(1, [{"id": 1, "payload": "x" * 500}])
+
+    async def upload(partition):
+        uploaded_sizes.append(partition.bytes)
+        uploaded_counts.append(partition.event_count)
+
+    await run_partitioned(
+        stream_key="dataset:single-large-event",
+        pages=pages(),
+        transform=transform,
+        upload=upload,
+        checkpoint=Checkpoint(tmp_path / "checkpoint.json"),
+        tuning=tuning(partition_bytes=100),
+    )
+
+    assert len(uploaded_sizes) == 1
+    assert uploaded_sizes[0] > 100
+    assert uploaded_counts == [1]
 
 
 async def test_bounded_gather_respects_global_limit() -> None:

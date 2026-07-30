@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime
 
 from opik_to_bt.checkpoint import Checkpoint
@@ -5,6 +6,10 @@ from opik_to_bt.config import Resource
 from opik_to_bt.migrate import Migrator, Selection
 from opik_to_bt.pipeline import Page
 from opik_to_bt.tuning import RuntimeTuning
+
+
+def decode_events(path) -> list[dict]:
+    return [json.loads(line) for line in path.read_bytes().splitlines()]
 
 
 class FakeSource:
@@ -67,11 +72,11 @@ class FakeTarget:
 
     async def insert_dataset(self, dataset_id, events, *, partition_key=None):
         del partition_key
-        self.datasets.extend(events)
+        self.datasets.extend(decode_events(events))
 
     async def insert_experiment(self, experiment_id, events, *, partition_key=None):
         del partition_key
-        self.experiments.extend(events)
+        self.experiments.extend(decode_events(events))
 
 
 async def test_migrator_filters_and_checkpoints(tmp_path) -> None:
@@ -160,7 +165,7 @@ async def test_logs_use_independent_bulk_trace_and_span_pagination(
 
         async def insert_logs(self, project_id, events, *, partition_key=None):
             del project_id, partition_key
-            self.events.extend(events)
+            self.events.extend(decode_events(events))
 
     source, target = LogSource(), LogTarget()
     migrator = Migrator(

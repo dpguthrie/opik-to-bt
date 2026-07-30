@@ -50,9 +50,13 @@ async def test_each_partition_gets_independent_bt_sync_state(tmp_path, monkeypat
         fresh=True,
     )
     dataset = target._handle("dataset", "project", "dataset")
+    first = tmp_path / "first.ndjson"
+    second = tmp_path / "second.ndjson"
+    first.write_bytes(b'{"id":"one"}\n')
+    second.write_bytes(b'{"id":"two"}\n')
 
-    await target.insert_dataset(dataset, [{"id": "one"}], partition_key="pages:1-2")
-    await target.insert_dataset(dataset, [{"id": "two"}], partition_key="pages:3-4")
+    await target.insert_dataset(dataset, first, partition_key="pages:1-2")
+    await target.insert_dataset(dataset, second, partition_key="pages:3-4")
 
     roots = [command[command.index("--root") + 1] for command in commands]
     assert len(commands) == 2
