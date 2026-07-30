@@ -2,9 +2,9 @@ import asyncio
 
 import pytest
 
-from opik_migrate.checkpoint import Checkpoint
-from opik_migrate.pipeline import Page, bounded_gather, run_partitioned
-from opik_migrate.tuning import RuntimeTuning
+from opik_to_bt.checkpoint import Checkpoint
+from opik_to_bt.pipeline import Page, bounded_gather, run_partitioned
+from opik_to_bt.tuning import RuntimeTuning
 
 
 def tuning(*, partition_bytes: int = 80, buffered: int = 1) -> RuntimeTuning:

@@ -1,6 +1,6 @@
 import pytest
 
-from opik_migrate.checkpoint import Checkpoint
+from opik_to_bt.checkpoint import Checkpoint
 
 
 def test_checkpoint_round_trip(tmp_path) -> None:

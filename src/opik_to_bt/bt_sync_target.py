@@ -9,8 +9,8 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from opik_migrate.config import Settings
-from opik_migrate.tuning import RuntimeTuning
+from opik_to_bt.config import Settings
+from opik_to_bt.tuning import RuntimeTuning
 
 
 class BtSyncTarget:

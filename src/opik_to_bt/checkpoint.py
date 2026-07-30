@@ -49,7 +49,7 @@ class Checkpoint:
             raise RuntimeError(
                 f"Cannot resume {key!r} with page size {page_size}; "
                 f"its checkpoint uses {existing}. Restore the original "
-                "OPIK_MIGRATE_PAGE_SIZE or start with a fresh state directory."
+                "OPIK_TO_BT_PAGE_SIZE or start with a fresh state directory."
             )
         self.data["page_sizes"][key] = page_size
         self.save()

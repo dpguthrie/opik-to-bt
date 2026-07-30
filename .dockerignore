@@ -1,7 +1,7 @@
 .git
 .env
 .venv
-.opik-migrate
+.opik-to-bt
 .pytest_cache
 .ruff_cache
 __pycache__

@@ -12,9 +12,9 @@ from typing import Any
 
 from opik import Opik
 
-from opik_migrate.config import Settings
-from opik_migrate.pipeline import Page
-from opik_migrate.util import as_dict
+from opik_to_bt.config import Settings
+from opik_to_bt.pipeline import Page
+from opik_to_bt.util import as_dict
 
 RetryCallback = Callable[..., None]
 

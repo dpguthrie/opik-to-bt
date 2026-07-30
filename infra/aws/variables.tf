@@ -1,7 +1,7 @@
 variable "name" {
   description = "Name prefix for the migration runner."
   type        = string
-  default     = "opik-migrate"
+  default     = "opik-to-bt"
 }
 
 variable "instance_type" {

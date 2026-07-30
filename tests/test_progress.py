@@ -2,7 +2,7 @@ from io import StringIO
 
 from rich.console import Console
 
-from opik_migrate.progress import RichMigrationProgress
+from opik_to_bt.progress import RichMigrationProgress
 
 
 def test_rich_progress_reports_pages_uploads_retries_and_completion() -> None:

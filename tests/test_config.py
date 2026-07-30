@@ -2,7 +2,7 @@ from datetime import UTC
 
 import pytest
 
-from opik_migrate.config import Resource, parse_csv, parse_datetime, parse_resources
+from opik_to_bt.config import Resource, parse_csv, parse_datetime, parse_resources
 
 
 def test_parse_csv_and_resources() -> None:

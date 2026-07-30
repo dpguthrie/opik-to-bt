@@ -1,10 +1,10 @@
 from datetime import UTC, datetime
 
-from opik_migrate.checkpoint import Checkpoint
-from opik_migrate.config import Resource
-from opik_migrate.migrate import Migrator, Selection
-from opik_migrate.pipeline import Page
-from opik_migrate.tuning import RuntimeTuning
+from opik_to_bt.checkpoint import Checkpoint
+from opik_to_bt.config import Resource
+from opik_to_bt.migrate import Migrator, Selection
+from opik_to_bt.pipeline import Page
+from opik_to_bt.tuning import RuntimeTuning
 
 
 class FakeSource:

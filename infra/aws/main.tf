@@ -88,9 +88,9 @@ resource "aws_instance" "runner" {
     curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
     curl -fsSL https://bt.dev/cli/install.sh -o /tmp/install-bt.sh
     XDG_BIN_HOME=/usr/local/bin bash /tmp/install-bt.sh --version 0.14.0
-    git clone --branch '${var.repo_ref}' '${var.repo_url}' /opt/opik-migrate
-    cd /opt/opik-migrate
-    UV_PROJECT_ENVIRONMENT=/opt/opik-migrate/.venv uv sync --frozen
+    git clone --branch '${var.repo_ref}' '${var.repo_url}' /opt/opik-to-bt
+    cd /opt/opik-to-bt
+    UV_PROJECT_ENVIRONMENT=/opt/opik-to-bt/.venv uv sync --frozen
   EOT
 
   tags = { Name = var.name }

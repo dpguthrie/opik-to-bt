@@ -6,8 +6,8 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
-from opik_migrate.checkpoint import Checkpoint
-from opik_migrate.tuning import RuntimeTuning
+from opik_to_bt.checkpoint import Checkpoint
+from opik_to_bt.tuning import RuntimeTuning
 
 
 @dataclass(frozen=True)

@@ -1,8 +1,8 @@
 import asyncio
 
-from opik_migrate.bt_sync_target import BtSyncTarget
-from opik_migrate.config import Settings
-from opik_migrate.tuning import RuntimeTuning
+from opik_to_bt.bt_sync_target import BtSyncTarget
+from opik_to_bt.config import Settings
+from opik_to_bt.tuning import RuntimeTuning
 
 
 def settings() -> Settings:

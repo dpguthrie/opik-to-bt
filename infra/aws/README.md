@@ -6,7 +6,7 @@ inbound SSH rule; connect with AWS Systems Manager.
 
 ```bash
 terraform init
-terraform apply -var 'repo_url=https://github.com/YOUR_ORG/opik-migrate.git'
+terraform apply -var 'repo_url=https://github.com/YOUR_ORG/opik-to-bt.git'
 aws ssm start-session --target "$(terraform output -raw instance_id)"
 ```
 
@@ -14,12 +14,12 @@ Override capacity only when needed:
 
 ```bash
 terraform apply \
-  -var 'repo_url=https://github.com/YOUR_ORG/opik-migrate.git' \
+  -var 'repo_url=https://github.com/YOUR_ORG/opik-to-bt.git' \
   -var 'instance_type=m7g.2xlarge' \
   -var 'root_volume_gb=500'
 ```
 
-Inside the session, place credentials in `/opt/opik-migrate/.env` (mode `0600`)
+Inside the session, place credentials in `/opt/opik-to-bt/.env` (mode `0600`)
 or export them from your existing secret-management workflow, then run the same
 commands documented in the main README.
 
@@ -29,5 +29,5 @@ policy to the instance role and retrieve the secrets at runtime.
 
 The root volume supports rolling partitions rather than storing the full
 migration. Stop the instance to retain its checkpoint. Terraform destruction
-also deletes the root volume, so copy `.opik-migrate/` elsewhere first if the
+also deletes the root volume, so copy `.opik-to-bt/` elsewhere first if the
 run must survive instance replacement.

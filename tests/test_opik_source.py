@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from opik_migrate.opik_source import (
+from opik_to_bt.opik_source import (
     AdaptiveRequestGate,
     OpikSource,
     retry_delay,
@@ -78,7 +78,7 @@ async def test_call_retries_through_shared_adaptive_gate(monkeypatch) -> None:
             raise RateLimited
         return "ok"
 
-    monkeypatch.setattr("opik_migrate.opik_source.retry_delay", lambda *_: 0.001)
+    monkeypatch.setattr("opik_to_bt.opik_source.retry_delay", lambda *_: 0.001)
 
     assert await source._call(endpoint) == "ok"
     assert attempts == 2

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from opik_migrate.util import as_dict, compact, isoformat, jsonable, unix_seconds
+from opik_to_bt.util import as_dict, compact, isoformat, jsonable, unix_seconds
 
 
 def source_id(prefix: str, value: Any) -> str:

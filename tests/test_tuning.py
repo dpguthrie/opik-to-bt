@@ -1,13 +1,13 @@
-from opik_migrate.config import Settings
-from opik_migrate.tuning import RuntimeTuning
+from opik_to_bt.config import Settings
+from opik_to_bt.tuning import RuntimeTuning
 
 
 def test_support_overrides_do_not_require_cli_flags(tmp_path, monkeypatch) -> None:
-    monkeypatch.setenv("OPIK_MIGRATE_PAGE_SIZE", "123")
-    monkeypatch.setenv("OPIK_MIGRATE_PARTITION_BYTES", str(32 * 1024 * 1024))
-    monkeypatch.setenv("OPIK_MIGRATE_RESOURCE_WORKERS", "3")
-    monkeypatch.setenv("OPIK_MIGRATE_UPLOAD_PROCESSES", "2")
-    monkeypatch.setenv("OPIK_MIGRATE_BT_WORKERS", "5")
+    monkeypatch.setenv("OPIK_TO_BT_PAGE_SIZE", "123")
+    monkeypatch.setenv("OPIK_TO_BT_PARTITION_BYTES", str(32 * 1024 * 1024))
+    monkeypatch.setenv("OPIK_TO_BT_RESOURCE_WORKERS", "3")
+    monkeypatch.setenv("OPIK_TO_BT_UPLOAD_PROCESSES", "2")
+    monkeypatch.setenv("OPIK_TO_BT_BT_WORKERS", "5")
 
     tuning = RuntimeTuning.detect(tmp_path, Settings())
 

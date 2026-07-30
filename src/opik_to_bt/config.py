@@ -54,16 +54,16 @@ class Settings(BaseSettings):
     braintrust_url: str = "https://api.braintrust.dev"
     braintrust_api_key: str | None = None
 
-    timeout_seconds: float = Field(60.0, alias="OPIK_MIGRATE_TIMEOUT_SECONDS", gt=0)
-    retry_attempts: int = Field(8, alias="OPIK_MIGRATE_RETRY_ATTEMPTS", ge=1)
-    page_size: int | None = Field(None, alias="OPIK_MIGRATE_PAGE_SIZE", ge=1, le=2000)
-    partition_bytes: int | None = Field(None, alias="OPIK_MIGRATE_PARTITION_BYTES", ge=1024 * 1024)
-    resource_workers: int | None = Field(None, alias="OPIK_MIGRATE_RESOURCE_WORKERS", ge=1, le=64)
+    timeout_seconds: float = Field(60.0, alias="OPIK_TO_BT_TIMEOUT_SECONDS", gt=0)
+    retry_attempts: int = Field(8, alias="OPIK_TO_BT_RETRY_ATTEMPTS", ge=1)
+    page_size: int | None = Field(None, alias="OPIK_TO_BT_PAGE_SIZE", ge=1, le=2000)
+    partition_bytes: int | None = Field(None, alias="OPIK_TO_BT_PARTITION_BYTES", ge=1024 * 1024)
+    resource_workers: int | None = Field(None, alias="OPIK_TO_BT_RESOURCE_WORKERS", ge=1, le=64)
     buffered_partitions: int | None = Field(
-        None, alias="OPIK_MIGRATE_BUFFERED_PARTITIONS", ge=1, le=8
+        None, alias="OPIK_TO_BT_BUFFERED_PARTITIONS", ge=1, le=8
     )
-    upload_processes: int | None = Field(None, alias="OPIK_MIGRATE_UPLOAD_PROCESSES", ge=1, le=16)
-    bt_workers: int | None = Field(None, alias="OPIK_MIGRATE_BT_WORKERS", ge=1, le=64)
+    upload_processes: int | None = Field(None, alias="OPIK_TO_BT_UPLOAD_PROCESSES", ge=1, le=16)
+    bt_workers: int | None = Field(None, alias="OPIK_TO_BT_BT_WORKERS", ge=1, le=64)
 
     @field_validator("opik_url", "braintrust_url")
     @classmethod

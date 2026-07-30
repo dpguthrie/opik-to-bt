@@ -12,4 +12,4 @@ COPY pyproject.toml uv.lock README.md ./
 COPY src ./src
 RUN uv sync --frozen --no-dev
 
-ENTRYPOINT ["/app/.venv/bin/opik-migrate"]
+ENTRYPOINT ["/app/.venv/bin/opik-to-bt"]

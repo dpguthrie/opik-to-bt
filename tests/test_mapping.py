@@ -1,4 +1,4 @@
-from opik_migrate.mapping import dataset_event, experiment_event, trace_events
+from opik_to_bt.mapping import dataset_event, experiment_event, trace_events
 
 
 def test_dataset_and_experiment_mapping() -> None:

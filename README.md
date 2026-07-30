@@ -65,7 +65,7 @@ jitter, slows concurrent streams, and reports the pause in the terminal before
 continuing automatically.
 
 After a successful `bt sync` upload, the temporary NDJSON partition is removed.
-Checkpoint and `bt sync` state remain under `.opik-migrate/`. An interrupted run
+Checkpoint and `bt sync` state remain under `.opik-to-bt/`. An interrupted run
 restarts at the last uploaded source page rather than the beginning.
 
 All uploads go through
@@ -89,7 +89,7 @@ the destination or set `BRAINTRUST_API_KEY`. Change `OPIK_URL` and
 Preview the selected scope:
 
 ```bash
-uv run opik-migrate migrate \
+uv run opik-to-bt \
   --projects support-bot \
   --start 2026-01-01 \
   --end 2026-02-01 \
@@ -99,7 +99,7 @@ uv run opik-migrate migrate \
 Run the migration:
 
 ```bash
-uv run opik-migrate migrate \
+uv run opik-to-bt \
   --projects support-bot \
   --start 2026-01-01 \
   --end 2026-02-01
@@ -108,7 +108,7 @@ uv run opik-migrate migrate \
 Resources default to `all`. Optional semantic filters remain available:
 
 ```bash
-uv run opik-migrate migrate \
+uv run opik-to-bt \
   --projects support-bot \
   --resources datasets,experiments,logs \
   --datasets golden-set,edge-cases \
@@ -117,7 +117,7 @@ uv run opik-migrate migrate \
   --end 2026-02-01
 ```
 
-No performance flags are required. Keep `.opik-migrate/` when moving or
+No performance flags are required. Keep `.opik-to-bt/` when moving or
 restarting the job. Use `--no-resume` only when intentionally ignoring importer
 completion markers; stable IDs and `bt sync` state still make replay safe.
 
@@ -131,7 +131,7 @@ completion markers; stable IDs and `bt sync` state still make replay safe.
 | `BRAINTRUST_URL` | `https://api.braintrust.dev` | Braintrust US/EU/self-hosted API |
 | `BRAINTRUST_API_KEY` | profile or environment | Braintrust authentication |
 
-Operational overrides exist through `OPIK_MIGRATE_*` environment variables for
+Operational overrides exist through `OPIK_TO_BT_*` environment variables for
 support and unusual deployments, but are deliberately omitted from the normal
 workflow. See the fields in `config.py` when diagnosing a constrained or
 rate-limited environment.
@@ -141,9 +141,9 @@ rate-limited environment.
 The image includes `bt` 0.14.0:
 
 ```bash
-docker build -t opik-migrate .
-docker run --rm --env-file .env -v "$PWD/.opik-migrate:/app/.opik-migrate" \
-  opik-migrate migrate --projects support-bot --resources all
+docker build -t opik-to-bt .
+docker run --rm --env-file .env -v "$PWD/.opik-to-bt:/app/.opik-to-bt" \
+  opik-to-bt --projects support-bot --resources all
 ```
 
 ## Run on AWS

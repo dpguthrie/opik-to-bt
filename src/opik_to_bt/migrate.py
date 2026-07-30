@@ -5,13 +5,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from opik_migrate.checkpoint import Checkpoint
-from opik_migrate.config import Resource, parse_datetime
-from opik_migrate.mapping import dataset_event, experiment_event, span_event, trace_event
-from opik_migrate.pipeline import Page, Partition, bounded_gather, run_partitioned
-from opik_migrate.progress import MigrationProgress
-from opik_migrate.tuning import RuntimeTuning
-from opik_migrate.util import as_dict, isoformat
+from opik_to_bt.checkpoint import Checkpoint
+from opik_to_bt.config import Resource, parse_datetime
+from opik_to_bt.mapping import dataset_event, experiment_event, span_event, trace_event
+from opik_to_bt.pipeline import Page, Partition, bounded_gather, run_partitioned
+from opik_to_bt.progress import MigrationProgress
+from opik_to_bt.tuning import RuntimeTuning
+from opik_to_bt.util import as_dict, isoformat
 
 
 @dataclass

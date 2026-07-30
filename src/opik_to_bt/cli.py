@@ -6,24 +6,19 @@ from typing import Annotated
 
 import typer
 
-from opik_migrate.bt_sync_target import BtSyncTarget
-from opik_migrate.checkpoint import Checkpoint
-from opik_migrate.config import Settings, parse_csv, parse_datetime, parse_resources
-from opik_migrate.migrate import Migrator, Selection
-from opik_migrate.opik_source import OpikSource
-from opik_migrate.progress import RichMigrationProgress
-from opik_migrate.tuning import RuntimeTuning
+from opik_to_bt.bt_sync_target import BtSyncTarget
+from opik_to_bt.checkpoint import Checkpoint
+from opik_to_bt.config import Settings, parse_csv, parse_datetime, parse_resources
+from opik_to_bt.migrate import Migrator, Selection
+from opik_to_bt.opik_source import OpikSource
+from opik_to_bt.progress import RichMigrationProgress
+from opik_to_bt.tuning import RuntimeTuning
 
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False)
 
 
-@app.callback()
-def main() -> None:
-    """Migrate Opik resources into Braintrust with bt sync."""
-
-
 @app.command()
-def migrate(
+def main(
     projects: Annotated[
         str | None, typer.Option(help="Comma-separated Opik project names.")
     ] = None,
@@ -44,7 +39,7 @@ def migrate(
     ] = None,
     state_dir: Annotated[
         Path, typer.Option(help="Directory for resumable migration state.")
-    ] = Path(".opik-migrate"),
+    ] = Path(".opik-to-bt"),
     resume: Annotated[
         bool, typer.Option("--resume/--no-resume", help="Resume completed resources.")
     ] = True,

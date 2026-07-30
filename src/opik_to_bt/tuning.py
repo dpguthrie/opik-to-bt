@@ -5,7 +5,7 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-from opik_migrate.config import Settings
+from opik_to_bt.config import Settings
 
 MIB = 1024 * 1024
 
