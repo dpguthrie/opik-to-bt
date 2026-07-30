@@ -39,10 +39,11 @@ is checked client-side. Traces become Braintrust root spans; spans become child
 spans using their existing `trace_id` and `parent_span_id`. The migrator never
 issues one span request per trace.
 
-Runtime settings are automatic. At startup the migrator considers available
-CPU, memory, and staging disk to choose page size, partition size, resource
-concurrency, upload slots, and `bt sync` workers. Users select *what* to migrate;
-the tool manages *how* it moves the data.
+Runtime settings are automatic. The migrator uses 2,000-record pages—the
+maximum Opik documents for its streaming search APIs—to minimize requests, then
+considers available CPU, memory, and staging disk to choose partition size,
+resource concurrency, upload slots, and `bt sync` workers. Users select *what*
+to migrate; the tool manages *how* it moves the data.
 
 When `--end` is omitted, the tool records the run's start time as a stable
 snapshot boundary for logs and experiments. New Opik activity cannot shift
@@ -134,8 +135,8 @@ IDs make the replay overwrite-safe.
 
 Operational overrides exist through `OPIK_TO_BT_*` environment variables for
 support and unusual deployments, but are deliberately omitted from the normal
-workflow. See the fields in `config.py` when diagnosing a constrained or
-rate-limited environment.
+workflow. See [Advanced configuration](#advanced-configuration) for every
+selection, connection, retry, and performance control.
 
 ## Run in a container
 
@@ -194,6 +195,60 @@ must remain on its root volume.
 
 Dataset version history is not included. A future opt-in mode could map Opik
 item history to Braintrust dataset snapshots.
+
+## Advanced configuration
+
+The automatic runtime is appropriate for most migrations. The controls below
+are useful for narrowing scope, integrating self-hosted deployments, or tuning
+a constrained or rate-limited runner. Settings are read from the process
+environment first, then `.env`, then the defaults shown below.
+
+### CLI flags
+
+| Flag | Default | Controls |
+|---|---:|---|
+| `--projects NAME[,NAME...]` | All projects | Limits the migration to exact Opik project names. |
+| `--resources all\|datasets,experiments,logs` | `all` | Selects resource types. Any comma-separated subset of `datasets`, `experiments`, and `logs` is valid. |
+| `--datasets NAME[,NAME...]` | All datasets | Limits datasets by exact name within the selected projects. This does not select experiments that reference an excluded dataset. |
+| `--experiments NAME[,NAME...]` | All experiments | Limits experiments by exact name within the selected projects. |
+| `--start ISO-8601` | No lower bound | Inclusive UTC lower bound for experiment creation time and root-trace start time. A timezone-free value is interpreted as UTC. It does not filter datasets. |
+| `--end ISO-8601` | Run-start snapshot | Exclusive UTC upper bound for experiments and logs. When omitted, the run start is checkpointed and reused on resume so new Opik data cannot move the boundary. |
+| `--state-dir PATH` | `.opik-to-bt` | Stores the checkpoint, rolling NDJSON partitions, and `bt sync` state. Preserve this directory to resume, including when running in Docker or on another machine. |
+| `--resume` / `--no-resume` | `--resume` | Reuses importer checkpoints and `bt sync` state. `--no-resume` ignores importer completion markers and passes `--fresh` to `bt sync`; stable event IDs keep replay overwrite-safe. |
+| `--dry-run` / `--no-dry-run` | `--no-dry-run` | Inventories the selected scope without checking Braintrust authentication or writing destination data. |
+
+`--help`, `--install-completion`, and `--show-completion` are standard CLI
+utility flags and do not affect migration behavior.
+
+### Connection and authentication variables
+
+| Environment variable | Default | Controls |
+|---|---:|---|
+| `OPIK_URL` | `https://www.comet.com/opik/api` | Opik API base URL. Set this for self-hosted Opik. A trailing slash is removed automatically. |
+| `OPIK_API_KEY` | Unset | Opik API key. |
+| `OPIK_WORKSPACE` | Unset | Opik workspace used by the SDK. |
+| `BRAINTRUST_URL` | `https://api.braintrust.dev` | Braintrust API base URL passed to `bt sync`. Set this for the EU endpoint or a self-hosted deployment. |
+| `BRAINTRUST_API_KEY` | Unset | Braintrust API key inherited by `bt sync`. When unset, `bt` uses its existing authenticated profile. |
+
+### Reliability and performance variables
+
+These are advanced overrides. Leaving them unset lets the migrator size itself
+from the runner's CPU, memory, and free staging disk.
+
+| Environment variable | Effective default | Controls |
+|---|---:|---|
+| `OPIK_TO_BT_TIMEOUT_SECONDS` | `60` | Per-request Opik HTTP timeout in seconds. Must be greater than zero. |
+| `OPIK_TO_BT_RETRY_ATTEMPTS` | `8` | Maximum total attempts for a retryable Opik request. The shared request gate honors server reset headers and applies bounded exponential backoff with jitter. |
+| `OPIK_TO_BT_PAGE_SIZE` | `2000` | Opik records requested per page (`1`–`2000`). The maximum minimizes API requests. Lower it when individual records are large or the runner is memory-constrained; a single page is the minimum in-memory transformation unit. Do not change it after a stream has checkpointed beyond page 1 unless starting fresh. |
+| `OPIK_TO_BT_PARTITION_BYTES` | Automatic, up to `256 MiB` | Target uncompressed NDJSON bytes per immutable `bt sync` partition; override values are specified in bytes. The automatic value is bounded by memory and free disk; the effective minimum is `16 MiB`. A single Opik page may exceed the target. |
+| `OPIK_TO_BT_RESOURCE_WORKERS` | `min(8, max(2, CPU/2))` | Maximum concurrent resource jobs and Opik request slots (`1`–`64`). Higher values improve extraction concurrency but increase API pressure and memory use. |
+| `OPIK_TO_BT_BUFFERED_PARTITIONS` | `2` | Ready-to-upload partitions buffered per active stream (`1`–`8`). Higher values allow more extraction/upload overlap at the cost of memory and staging disk. |
+| `OPIK_TO_BT_UPLOAD_PROCESSES` | `min(2, max(1, CPU/4))` | Concurrent `bt sync` subprocesses across the migration (`1`–`16`). |
+| `OPIK_TO_BT_BT_WORKERS` | `min(16, max(2, CPU/upload processes))` | Parallel workers passed to each `bt sync push` process (`1`–`64`). Approximate maximum upload concurrency is upload processes multiplied by these workers. |
+
+The CLI prints the resolved resource-worker, upload-slot, and partition-size
+values at startup. If a resume fails because `OPIK_TO_BT_PAGE_SIZE` changed,
+restore the original value or use a new `--state-dir`.
 
 ## Development
 

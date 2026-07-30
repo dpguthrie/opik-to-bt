@@ -5,7 +5,7 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-from opik_to_bt.config import Settings
+from opik_to_bt.config import OPIK_MAX_PAGE_SIZE, Settings
 
 MIB = 1024 * 1024
 
@@ -59,7 +59,7 @@ class RuntimeTuning:
         upload_processes = settings.upload_processes or min(2, max(1, cpu // 4))
         bt_workers = settings.bt_workers or min(16, max(2, cpu // upload_processes))
         return cls(
-            page_size=settings.page_size or 500,
+            page_size=settings.page_size or OPIK_MAX_PAGE_SIZE,
             partition_bytes=partition_bytes,
             resource_workers=resource_workers,
             buffered_partitions=buffered,

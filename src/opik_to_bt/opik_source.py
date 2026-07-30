@@ -12,7 +12,7 @@ from typing import Any
 
 from opik import Opik
 
-from opik_to_bt.config import Settings
+from opik_to_bt.config import OPIK_MAX_PAGE_SIZE, Settings
 from opik_to_bt.pipeline import Page
 from opik_to_bt.util import as_dict
 
@@ -114,7 +114,7 @@ class OpikSource:
         self,
         settings: Settings,
         *,
-        page_size: int = 500,
+        page_size: int = OPIK_MAX_PAGE_SIZE,
         request_workers: int = 4,
         on_retry: RetryCallback | None = None,
     ) -> None:

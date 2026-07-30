@@ -6,6 +6,8 @@ from enum import StrEnum
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+OPIK_MAX_PAGE_SIZE = 2000
+
 
 class Resource(StrEnum):
     DATASETS = "datasets"
@@ -56,7 +58,7 @@ class Settings(BaseSettings):
 
     timeout_seconds: float = Field(60.0, alias="OPIK_TO_BT_TIMEOUT_SECONDS", gt=0)
     retry_attempts: int = Field(8, alias="OPIK_TO_BT_RETRY_ATTEMPTS", ge=1)
-    page_size: int | None = Field(None, alias="OPIK_TO_BT_PAGE_SIZE", ge=1, le=2000)
+    page_size: int | None = Field(None, alias="OPIK_TO_BT_PAGE_SIZE", ge=1, le=OPIK_MAX_PAGE_SIZE)
     partition_bytes: int | None = Field(None, alias="OPIK_TO_BT_PARTITION_BYTES", ge=1024 * 1024)
     resource_workers: int | None = Field(None, alias="OPIK_TO_BT_RESOURCE_WORKERS", ge=1, le=64)
     buffered_partitions: int | None = Field(
