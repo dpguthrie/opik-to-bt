@@ -171,11 +171,11 @@ must remain on its root volume.
   keep their names, `guardrail` becomes `function`, and `general` becomes
   `task`. Anything unrecognized also becomes `task`.
 - Opik tags become native Braintrust tags rather than metadata, mapped one to
-  one. Trace tags go on the Braintrust root span, span tags stay on their own
-  span, and dataset item tags go on the matching Braintrust dataset record;
-  Braintrust aggregates a trace's span tags for display at the trace level.
-  Braintrust tags are shared project settings, so add the tag names in the
-  destination project's tag settings to control their color and description.
+  one: trace tags onto the Braintrust root span, span tags onto that same child
+  span, and dataset item tags onto the matching Braintrust dataset record.
+  Braintrust accepts tags on child spans as well as root spans, and stores each
+  span's tags on that span. Migrated tag names do not have to exist in the
+  destination project beforehand.
 - Opik dataset-level and experiment-level tags stay object-level in Braintrust
   rather than being copied onto every row, because Opik has no per-record tags
   on experiment results and stamping the object's tags onto each row would
