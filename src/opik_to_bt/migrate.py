@@ -70,6 +70,12 @@ class Migrator:
             )
             yield page
 
+    async def _apply_tags(self, kind: str, source_id: str, tags: Any) -> None:
+        """Tag the destination object, whether this run uploaded it or resumed past it."""
+        handle = self.checkpoint.target(kind, source_id)
+        if handle and tags:
+            await self.target.apply_tags(handle, [str(tag) for tag in tags])
+
     async def _upload(
         self,
         method: Any,
@@ -159,6 +165,7 @@ class Migrator:
         stream_key = f"dataset:{raw['id']}"
         if self.checkpoint.completed(stream_key):
             self.progress.checkpointed(f"dataset {raw['name']}")
+            await self._apply_tags("dataset", str(raw["id"]), raw.get("tags"))
             return
         self.checkpoint.bind_page_size(stream_key, self.tuning.page_size)
         target_id = self.checkpoint.target("dataset", str(raw["id"]))
@@ -198,6 +205,7 @@ class Migrator:
             checkpoint=self.checkpoint,
             tuning=self.tuning,
         )
+        await self._apply_tags("dataset", str(raw["id"]), raw.get("tags"))
         self.progress.complete(task, items=count, partitions=partitions)
 
     async def _experiments(
@@ -220,6 +228,7 @@ class Migrator:
         stream_key = f"experiment:{raw['id']}"
         if self.checkpoint.completed(stream_key):
             self.progress.checkpointed(f"experiment {raw['name']}")
+            await self._apply_tags("experiment", str(raw["id"]), raw.get("tags"))
             return
         self.checkpoint.bind_page_size(stream_key, self.tuning.page_size)
         source_dataset_id = raw.get("dataset_id")
@@ -269,6 +278,7 @@ class Migrator:
             checkpoint=self.checkpoint,
             tuning=self.tuning,
         )
+        await self._apply_tags("experiment", str(raw["id"]), raw.get("tags"))
         self.progress.complete(task, items=count, partitions=partitions)
 
     async def _logs(

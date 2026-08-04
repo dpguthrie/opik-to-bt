@@ -10,6 +10,14 @@ def source_id(prefix: str, value: Any) -> str:
     return f"opik:{prefix}:{value}"
 
 
+def tag_list(value: Any) -> list[str] | None:
+    """Map an Opik tag list onto Braintrust's tag list, dropping blanks and repeats."""
+    if isinstance(value, str):
+        value = [value]
+    tags = {text: None for tag in value or [] if (text := str(tag).strip())}
+    return list(tags) or None
+
+
 def _number(value: Any) -> float | None:
     try:
         number = float(value)
@@ -175,6 +183,7 @@ def dataset_event(item: Any) -> dict[str, Any]:
             "id": source_id("dataset-item", item_id),
             "input": data_input(data),
             "expected": expected,
+            "tags": tag_list(raw.get("tags")),
             "metadata": {
                 **(data.get("metadata") or {}),
                 "opik": {"item_id": item_id},
@@ -329,12 +338,12 @@ def trace_event(
             "output": raw_trace.get("output"),
             "error": raw_trace.get("error_info"),
             "scores": scores or None,
+            "tags": tag_list(raw_trace.get("tags")),
             "metadata": {
                 **(raw_trace.get("metadata") or {}),
                 "opik": {
                     "trace_id": raw_trace["id"],
                     "project_name": raw_trace.get("project_name"),
-                    "tags": raw_trace.get("tags"),
                     "feedback_scores": raw_trace.get("feedback_scores"),
                     "aggregate_usage": raw_trace.get("usage"),
                     "aggregate_estimated_cost": raw_trace.get("total_estimated_cost"),
@@ -380,6 +389,7 @@ def span_event(trace_id: Any, span: Any) -> dict[str, Any]:
             "output": raw.get("output"),
             "error": raw.get("error_info"),
             "scores": scores or None,
+            "tags": tag_list(raw.get("tags")),
             "metadata": {
                 **(raw.get("metadata") or {}),
                 "opik": {
@@ -387,7 +397,6 @@ def span_event(trace_id: Any, span: Any) -> dict[str, Any]:
                     "trace_id": trace_id,
                     "model": raw.get("model"),
                     "provider": raw.get("provider"),
-                    "tags": raw.get("tags"),
                     "feedback_scores": raw.get("feedback_scores"),
                     "duration_ms": raw.get("duration"),
                     "ttft_ms": raw.get("ttft"),

@@ -17,10 +17,10 @@ class FakeSource:
         return [{"id": "p1", "name": "selected"}, {"id": "p2", "name": "ignored"}]
 
     async def datasets(self, project_id):
-        return [{"id": "d1", "name": "dataset"}]
+        return [{"id": "d1", "name": "dataset", "tags": ["curated"]}]
 
     async def dataset_items(self, dataset_id):
-        return [{"id": "row", "data": {"input": {"hello": "world"}}}]
+        return [{"id": "row", "tags": ["golden"], "data": {"input": {"hello": "world"}}}]
 
     async def experiments(self, project_id):
         return [
@@ -29,6 +29,7 @@ class FakeSource:
                 "name": "recent",
                 "created_at": "2026-02-01T00:00:00Z",
                 "dataset_id": "d1",
+                "tags": ["baseline"],
             },
             {"id": "e2", "name": "old", "created_at": "2025-01-01T00:00:00Z"},
         ]
@@ -57,9 +58,13 @@ class FakeTarget:
     def __init__(self):
         self.datasets = []
         self.experiments = []
+        self.tagged = []
 
     async def check(self):
         return None
+
+    async def apply_tags(self, handle, tags):
+        self.tagged.append((handle, tags))
 
     async def create_project(self, name, description):
         return "bt-project"
@@ -95,8 +100,16 @@ async def test_migrator_filters_and_checkpoints(tmp_path) -> None:
     await migrator.run(selection)
 
     assert len(target.datasets) == 1
+    assert target.datasets[0]["tags"] == ["golden"]
     assert len(target.experiments) == 3
     assert target.experiments[0]["id"] == "opik:experiment-item:result"
+    # Object-level tags apply on the fresh run and again on the checkpointed rerun.
+    assert target.tagged == [
+        ("bt-dataset", ["curated"]),
+        ("bt-experiment", ["baseline"]),
+        ("bt-dataset", ["curated"]),
+        ("bt-experiment", ["baseline"]),
+    ]
     assert target.experiments[1]["_object_delete"] is True
     assert target.experiments[2]["scores"] == {"Test suite passed": 1.0}
     assert target.experiments[2]["metadata"]["assertions"] == [
@@ -125,6 +138,7 @@ async def test_logs_use_independent_bulk_trace_and_span_pagination(
                         "start_time": "2026-01-31T23:59:59Z",
                         "usage": {"prompt_tokens": 10, "completion_tokens": 2},
                         "total_estimated_cost": 0.02,
+                        "tags": ["production"],
                     },
                     {"id": "at-end", "start_time": "2026-02-01T00:00:00Z"},
                 ],
@@ -149,6 +163,7 @@ async def test_logs_use_independent_bulk_trace_and_span_pagination(
                         "start_time": "2026-01-31T23:59:59Z",
                         "usage": {"prompt_tokens": 10, "completion_tokens": 2},
                         "total_estimated_cost": 0.02,
+                        "tags": ["retrieval"],
                     },
                     {
                         "id": "span-at-end",
@@ -191,6 +206,8 @@ async def test_logs_use_independent_bulk_trace_and_span_pagination(
     }
     root = next(event for event in target.events if event["is_root"])
     span = next(event for event in target.events if not event["is_root"])
+    assert root["tags"] == ["production"]
+    assert span["tags"] == ["retrieval"]
     assert "prompt_tokens" not in root["metrics"]
     assert "estimated_cost" not in root["metrics"]
     assert root["metadata"]["opik"]["aggregate_usage"]["prompt_tokens"] == 10

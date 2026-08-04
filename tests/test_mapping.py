@@ -168,6 +168,37 @@ def test_test_suite_input_output_and_assertions() -> None:
     }
 
 
+def test_tags_map_to_native_braintrust_tags() -> None:
+    events = trace_events(
+        {
+            "id": "trace-1",
+            "start_time": "2026-01-01T00:00:00Z",
+            "tags": ["production", "  regression  ", ""],
+        },
+        [
+            {
+                "id": "span-1",
+                "trace_id": "trace-1",
+                "start_time": "2026-01-01T00:00:00Z",
+                "tags": ["regression", "retrieval"],
+            }
+        ],
+    )
+    root, span = events
+    assert root["tags"] == ["production", "regression"]
+    assert "tags" not in root["metadata"]["opik"]
+    assert span["tags"] == ["regression", "retrieval"]
+    assert "tags" not in span["metadata"]["opik"]
+
+    untagged = trace_event({"id": "trace-2", "start_time": "2026-01-01T00:00:00Z"})
+    assert "tags" not in untagged
+    assert "tags" not in span_event("trace-2", {"id": "span-2", "tags": []})
+
+    dataset = dataset_event({"id": "item-1", "tags": ["golden"], "data": {"input": {"x": 1}}})
+    assert dataset["tags"] == ["golden"]
+    assert "tags" not in dataset_event({"id": "item-2", "data": {"input": {"x": 1}}})
+
+
 def test_trace_and_span_feedback_and_standard_metrics() -> None:
     trace = trace_event(
         {
