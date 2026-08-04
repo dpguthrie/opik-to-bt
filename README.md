@@ -167,8 +167,9 @@ must remain on its root volume.
 ## Mapping notes
 
 - Opik trace and span relationships become Braintrust root spans and child
-  spans. Opik LLM/tool/guardrail types map to Braintrust
-  `llm`/`tool`/`classifier`; other spans map to `task`.
+  spans. Opik has four span types, and all four are mapped: `llm` and `tool`
+  keep their names, `guardrail` becomes `function`, and `general` becomes
+  `task`. Anything unrecognized also becomes `task`.
 - Opik tags become native Braintrust tags rather than metadata, mapped one to
   one. Trace tags go on the Braintrust root span, span tags stay on their own
   span, and dataset item tags go on the matching Braintrust dataset record;

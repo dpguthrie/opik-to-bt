@@ -374,7 +374,7 @@ def span_event(trace_id: Any, span: Any) -> dict[str, Any]:
     span_type = {
         "llm": "llm",
         "tool": "tool",
-        "guardrail": "classifier",
+        "guardrail": "function",
     }.get(str(raw.get("type", "")).lower(), "task")
     name = raw.get("name") or "Opik span"
     return compact(

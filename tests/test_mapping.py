@@ -168,6 +168,24 @@ def test_test_suite_input_output_and_assertions() -> None:
     }
 
 
+def test_every_opik_span_type_maps_to_a_braintrust_span_type() -> None:
+    # Opik's SpanType enum is exhaustively general/tool/llm/guardrail.
+    mapped = {
+        opik_type: span_event("trace-1", {"id": "span-1", "type": opik_type})["span_attributes"][
+            "type"
+        ]
+        for opik_type in ("general", "tool", "llm", "guardrail", "", "something-new")
+    }
+    assert mapped == {
+        "general": "task",
+        "tool": "tool",
+        "llm": "llm",
+        "guardrail": "function",
+        "": "task",
+        "something-new": "task",
+    }
+
+
 def test_tags_map_to_native_braintrust_tags() -> None:
     events = trace_events(
         {
