@@ -26,6 +26,45 @@ def test_handle_survives_checkpoint_round_trip(tmp_path) -> None:
     assert restored._decode(dataset) == ("dataset", "source project", "golden set")
 
 
+async def test_apply_tags_resolves_the_object_by_name_then_patches(tmp_path) -> None:
+    requests = []
+    target = BtSyncTarget(tmp_path, settings())
+
+    def fake_request(method, path, payload=None):
+        requests.append((method, path, payload))
+        return {"objects": [{"id": "bt-object-1"}]} if method == "GET" else {}
+
+    target._request = fake_request
+
+    await target.apply_tags(target._handle("dataset", "my project", "golden set"), ["curated"])
+    await target.apply_tags(target._handle("experiment", "my project", "run 1"), ["baseline"])
+    # Logs have no taggable object, and an empty tag list has nothing to write.
+    await target.apply_tags(target._handle("project_logs", "my project", "my project"), ["skip"])
+    await target.apply_tags(target._handle("dataset", "my project", "golden set"), [])
+
+    assert requests == [
+        ("GET", "/v1/dataset?project_name=my+project&dataset_name=golden+set", None),
+        ("PATCH", "/v1/dataset/bt-object-1", {"tags": ["curated"]}),
+        ("GET", "/v1/experiment?project_name=my+project&experiment_name=run+1", None),
+        ("PATCH", "/v1/experiment/bt-object-1", {"tags": ["baseline"]}),
+    ]
+
+
+async def test_apply_tags_skips_objects_that_were_never_uploaded(tmp_path) -> None:
+    requests = []
+    target = BtSyncTarget(tmp_path, settings())
+
+    def fake_request(method, path, payload=None):
+        requests.append(method)
+        return {"objects": []}
+
+    target._request = fake_request
+
+    await target.apply_tags(target._handle("dataset", "project", "empty set"), ["curated"])
+
+    assert requests == ["GET"]
+
+
 async def test_each_partition_gets_independent_bt_sync_state(tmp_path, monkeypatch) -> None:
     commands = []
 

@@ -167,8 +167,25 @@ must remain on its root volume.
 ## Mapping notes
 
 - Opik trace and span relationships become Braintrust root spans and child
-  spans. Opik LLM/tool/guardrail types map to Braintrust
-  `llm`/`tool`/`classifier`; other spans map to `task`.
+  spans. Opik has four span types, and all four are mapped: `llm` and `tool`
+  keep their names, `guardrail` becomes `function`, and `general` becomes
+  `task`. Anything unrecognized also becomes `task`.
+- Opik tags become native Braintrust tags rather than metadata, mapped one to
+  one. Trace tags go on the Braintrust root span, span tags stay on their own
+  span, and dataset item tags go on the matching Braintrust dataset record;
+  Braintrust aggregates a trace's span tags for display at the trace level.
+  Braintrust tags are shared project settings, so add the tag names in the
+  destination project's tag settings to control their color and description.
+- Opik dataset-level and experiment-level tags stay object-level in Braintrust
+  rather than being copied onto every row, because Opik has no per-record tags
+  on experiment results and stamping the object's tags onto each row would
+  invent data Opik does not have. `bt sync` writes only rows, so these tags are
+  applied through Braintrust's REST API once the destination object exists,
+  which also means they need `BRAINTRUST_API_KEY`: a `bt` login profile alone
+  cannot authenticate them. Objects that received no rows are skipped, and the
+  tags reapply on a resumed run even when the rows themselves are already
+  checkpointed. The patch replaces the object's tag list, so tags added by hand
+  in Braintrust on a migrated dataset or experiment are overwritten.
 - Opik feedback in Braintrust's score range `[0, 1]` becomes scores. Numeric
   feedback outside that range becomes a custom metric and the original
   feedback objects are retained under `metadata.opik`.
