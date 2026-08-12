@@ -8,7 +8,7 @@ import typer
 
 from opik_to_bt.bt_sync_target import BtSyncTarget
 from opik_to_bt.checkpoint import Checkpoint
-from opik_to_bt.config import Settings, parse_csv, parse_datetime, parse_resources
+from opik_to_bt.config import PromptHistory, Settings, parse_csv, parse_datetime, parse_resources
 from opik_to_bt.migrate import Migrator, Selection
 from opik_to_bt.opik_source import OpikSource
 from opik_to_bt.progress import RichMigrationProgress
@@ -23,13 +23,24 @@ def main(
         str | None, typer.Option(help="Comma-separated Opik project names.")
     ] = None,
     resources: Annotated[
-        str, typer.Option(help="all, or a comma-separated list: datasets,experiments,logs.")
+        str,
+        typer.Option(help="all, or a comma-separated list: datasets,experiments,logs,prompts."),
     ] = "all",
     datasets: Annotated[
         str | None, typer.Option(help="Optional comma-separated dataset names.")
     ] = None,
     experiments: Annotated[
         str | None, typer.Option(help="Optional comma-separated experiment names.")
+    ] = None,
+    prompts: Annotated[
+        str | None, typer.Option(help="Optional comma-separated prompt names.")
+    ] = None,
+    prompt_history: Annotated[
+        PromptHistory | None,
+        typer.Option(
+            help="Prompt versions to migrate: latest (default) or all. "
+            "Also configurable with OPIK_TO_BT_PROMPT_HISTORY."
+        ),
     ] = None,
     start: Annotated[
         str | None, typer.Option(help="Inclusive ISO-8601 UTC start for experiments and logs.")
@@ -58,6 +69,8 @@ def main(
             projects=parse_csv(projects),
             datasets=parse_csv(datasets),
             experiments=parse_csv(experiments),
+            prompts=parse_csv(prompts),
+            prompt_history=prompt_history or settings.prompt_history,
             start=start_at,
             end=end_at,
             dry_run=dry_run,

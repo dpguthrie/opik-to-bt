@@ -40,6 +40,9 @@ class BtSyncTarget:
         self.upload_slots = asyncio.Semaphore(tuning.upload_processes)
         self.workers = tuning.bt_workers
         self.fresh = fresh
+        self._project_ids: dict[str, str] = {}
+        self._project_descriptions: dict[str, str | None] = {}
+        self._project_lock = asyncio.Lock()
 
     async def close(self) -> None:
         return None
@@ -49,8 +52,56 @@ class BtSyncTarget:
             raise RuntimeError("The Braintrust CLI (`bt`) is not on PATH. Install bt >= 0.14.0.")
 
     async def create_project(self, name: str, description: str | None) -> str:
-        del description
+        self._project_descriptions[name] = description
         return self._handle("project_logs", name, name)
+
+    async def _prompt_project_id(self, project_handle: str) -> str:
+        _, project, _ = self._decode(project_handle)
+        if cached := self._project_ids.get(project):
+            return cached
+        async with self._project_lock:
+            if cached := self._project_ids.get(project):
+                return cached
+            query = urllib.parse.urlencode({"project_name": project})
+            found = await asyncio.to_thread(self._request, "GET", f"/v1/project?{query}")
+            objects = found.get("objects") or []
+            if objects:
+                project_id = str(objects[0]["id"])
+            else:
+                created = await asyncio.to_thread(
+                    self._request,
+                    "POST",
+                    "/v1/project",
+                    {
+                        "name": project,
+                        "description": self._project_descriptions.get(project),
+                    },
+                )
+                project_id = str(created["id"])
+            self._project_ids[project] = project_id
+            return project_id
+
+    async def get_prompt(self, project_handle: str, slug: str) -> dict[str, Any] | None:
+        project_id = await self._prompt_project_id(project_handle)
+        query = urllib.parse.urlencode({"project_id": project_id, "slug": slug})
+        found = await asyncio.to_thread(self._request, "GET", f"/v1/prompt?{query}")
+        objects = found.get("objects") or []
+        return objects[0] if objects else None
+
+    async def write_prompt(
+        self,
+        project_handle: str,
+        definition: dict[str, Any],
+        *,
+        update: bool,
+    ) -> dict[str, Any]:
+        project_id = await self._prompt_project_id(project_handle)
+        return await asyncio.to_thread(
+            self._request,
+            "PUT" if update else "POST",
+            "/v1/prompt",
+            {"project_id": project_id, **definition},
+        )
 
     async def create_dataset(self, project_id: str, name: str, description: str | None) -> str:
         del description
@@ -116,8 +167,8 @@ class BtSyncTarget:
         api_key = self.api_key or os.environ.get("BRAINTRUST_API_KEY")
         if not api_key:
             raise RuntimeError(
-                "Object-level tags need BRAINTRUST_API_KEY; `bt` login profiles "
-                "do not cover direct Braintrust REST calls."
+                "Prompt migration and object-level tags need BRAINTRUST_API_KEY; "
+                "`bt` login profiles do not cover direct Braintrust REST calls."
             )
         request = urllib.request.Request(
             f"{self.api_url}{path}",

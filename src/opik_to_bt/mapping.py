@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
+import re
+import unicodedata
 from typing import Any
 
 from opik_to_bt.util import as_dict, compact, isoformat, jsonable, unix_seconds
@@ -16,6 +20,67 @@ def tag_list(value: Any) -> list[str] | None:
         value = [value]
     tags = {text: None for tag in value or [] if (text := str(tag).strip())}
     return list(tags) or None
+
+
+def prompt_slug(name: str, source_prompt_id: str) -> str:
+    """Build a readable, deterministic Braintrust slug without name collisions."""
+    normalized = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode()
+    stem = re.sub(r"[^a-z0-9]+", "-", normalized.lower()).strip("-") or "opik-prompt"
+    suffix = hashlib.sha256(source_prompt_id.encode()).hexdigest()[:8]
+    return f"{stem[:80].rstrip('-')}-{suffix}"
+
+
+def prompt_definition(prompt: Any, version: Any) -> dict[str, Any]:
+    """Map one Opik prompt snapshot to Braintrust's public prompt schema."""
+    container = jsonable(as_dict(prompt))
+    snapshot = jsonable(as_dict(version))
+    structure = str(
+        snapshot.get("template_structure") or container.get("template_structure") or "text"
+    ).lower()
+    template = snapshot.get("template")
+    if not isinstance(template, str):
+        raise ValueError(f"Opik prompt {container.get('name')!r} has no string template")
+
+    if structure == "chat":
+        try:
+            messages = json.loads(template)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"Opik chat prompt {container.get('name')!r} has invalid message JSON"
+            ) from exc
+        if not isinstance(messages, list):
+            raise ValueError(
+                f"Opik chat prompt {container.get('name')!r} does not contain a message list"
+            )
+        prompt_block: dict[str, Any] = {"type": "chat", "messages": messages}
+    elif structure in {"text", "string"}:
+        prompt_block = {"type": "completion", "content": template}
+    else:
+        raise ValueError(
+            f"Opik prompt {container.get('name')!r} has unsupported template "
+            f"structure {structure!r}"
+        )
+
+    template_type = str(snapshot.get("type") or "mustache").lower()
+    template_format = {
+        "mustache": "mustache",
+        "jinja2": "nunjucks",
+    }.get(template_type, "none")
+    tags = snapshot.get("tags")
+    if tags is None:
+        tags = container.get("tags")
+
+    return {
+        "name": str(container["name"]),
+        # Keep explicit null/empty values because PUT is a full snapshot. Omitting
+        # them could retain fields from the preceding Braintrust version.
+        "description": container.get("description"),
+        "prompt_data": {
+            "prompt": prompt_block,
+            "template_format": template_format,
+        },
+        "tags": tag_list(tags) or [],
+    }
 
 
 def _number(value: Any) -> float | None:

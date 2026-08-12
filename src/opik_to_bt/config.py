@@ -13,6 +13,12 @@ class Resource(StrEnum):
     DATASETS = "datasets"
     EXPERIMENTS = "experiments"
     LOGS = "logs"
+    PROMPTS = "prompts"
+
+
+class PromptHistory(StrEnum):
+    LATEST = "latest"
+    ALL = "all"
 
 
 def parse_datetime(value: str | datetime | None) -> datetime | None:
@@ -66,6 +72,10 @@ class Settings(BaseSettings):
     )
     upload_processes: int | None = Field(None, alias="OPIK_TO_BT_UPLOAD_PROCESSES", ge=1, le=16)
     bt_workers: int | None = Field(None, alias="OPIK_TO_BT_BT_WORKERS", ge=1, le=64)
+    prompt_history: PromptHistory = Field(
+        PromptHistory.LATEST,
+        alias="OPIK_TO_BT_PROMPT_HISTORY",
+    )
 
     @field_validator("opik_url", "braintrust_url")
     @classmethod

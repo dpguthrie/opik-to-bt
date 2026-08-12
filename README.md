@@ -1,8 +1,8 @@
 # Opik → Braintrust migrator
 
-A resumable Python 3.13 CLI for moving Opik datasets, experiments, and
-traces/spans into Braintrust. It supports Opik Cloud or self-hosted Opik and
-Braintrust US, EU, or self-hosted deployments.
+A resumable Python 3.13 CLI for moving Opik prompts, datasets, experiments,
+and traces/spans into Braintrust. It supports Opik Cloud or self-hosted Opik
+and Braintrust US, EU, or self-hosted deployments.
 
 ## What it migrates
 
@@ -12,15 +12,16 @@ Braintrust US, EU, or self-hosted deployments.
 | Datasets and items | Datasets and records | `--datasets` |
 | Experiments and results | Experiments and events | `--experiments`, `--start`, `--end` |
 | Traces and spans | Project logs | `--start`, `--end` |
+| Prompts | Prompts | `--prompts`, `--prompt-history` |
 
 `--start` is inclusive and `--end` is exclusive. Dates apply to experiment
 creation time and root trace start time; all child spans of a selected trace are
-preserved. Datasets are not inherently time-bounded.
+preserved. Datasets and prompts are not inherently time-bounded.
 
 ## How it scales
 
-The migrator does not download a complete resource before uploading it. It
-operates as a bounded pipeline:
+The migrator does not download a complete row resource before uploading it. It
+operates as a bounded pipeline for datasets, experiments, and logs:
 
 ```text
 Opik pages → incremental transform/staging → bt sync → checkpoint
@@ -30,9 +31,16 @@ Extraction and upload overlap. Each transformed event is serialized once into
 a rolling NDJSON staging file; the file rotates at the partition target even in
 the middle of a large Opik page. Ready partitions live on staging disk rather
 than in memory while they wait for `bt sync`. Independent projects, datasets,
-and experiments run concurrently, while bounded queues prevent memory or disk
-usage from growing with the total migration size. Dataset migrations complete
-before dependent experiments.
+logs, and prompt jobs run concurrently, while bounded queues prevent memory or
+disk usage from growing with the total migration size. Dataset migrations
+complete before dependent experiments.
+
+Project-scoped prompts use the Braintrust REST API because `bt sync` operates on
+data rows, not prompt definitions. The default `latest` mode retrieves each
+Opik prompt's explicit `latest_version` and creates one Braintrust version. The
+opt-in `all` mode paginates every Opik version and writes them oldest-to-newest
+so the Braintrust prompt ends on the same latest content. Each source version
+ID maps to its returned Braintrust `_xact_id` in the checkpoint.
 
 Opik traces and spans are separate resources. The migrator paginates each
 project-wide endpoint in bulk: each trace page becomes a bounded chunk, then one
@@ -42,11 +50,13 @@ is checked client-side. Traces become Braintrust root spans; spans become child
 spans using their existing `trace_id` and `parent_span_id`. The migrator never
 issues one span request per trace.
 
-Runtime settings are automatic. The migrator uses 2,000-record pages—the
-maximum Opik documents for its streaming search APIs—to minimize requests, then
-considers available CPU, memory, and staging disk to choose partition size,
-resource concurrency, upload slots, and `bt sync` workers. Users select *what*
-to migrate; the tool manages *how* it moves the data.
+Runtime settings are automatic. The row-resource streams use 2,000-record
+pages—the maximum Opik documents for those search APIs—to minimize requests.
+Prompt containers and prompt versions use their endpoint limits of 1,000 and
+100 per page, respectively. The migrator then considers available CPU, memory,
+and staging disk to choose partition size, resource concurrency, upload slots,
+and `bt sync` workers. Users select *what* to migrate; the tool manages *how*
+it moves the data.
 
 When `--end` is omitted, the tool records the run's start time as a stable
 snapshot boundary for logs and experiments. New Opik activity cannot shift
@@ -73,9 +83,10 @@ Checkpoint and `bt sync` state remain under `.opik-to-bt/`. An interrupted run
 restarts after the last uploaded event, including when that position is in the
 middle of an Opik page.
 
-All uploads go through
+Dataset records, experiment events, and logs go through
 [`bt sync`](https://www.braintrust.dev/docs/reference/cli/sync), which provides
-parallel, byte-bounded uploads, retries, and resumable upload state.
+parallel, byte-bounded uploads, retries, and resumable upload state. Prompt
+definitions use Braintrust's versioned prompt REST endpoints.
 
 ## Quick start
 
@@ -88,8 +99,10 @@ cp .env.example .env
 ```
 
 Set `OPIK_API_KEY` and `OPIK_WORKSPACE` in `.env`, then authenticate `bt` against
-the destination or set `BRAINTRUST_API_KEY`. Change `OPIK_URL` and
-`BRAINTRUST_URL` for self-hosted deployments.
+the destination or set `BRAINTRUST_API_KEY`. Prompt migration and object-level
+dataset/experiment tags specifically require `BRAINTRUST_API_KEY`; a `bt` login
+profile alone cannot authenticate those direct REST requests. Change `OPIK_URL`
+and `BRAINTRUST_URL` for self-hosted deployments.
 
 Preview the selected scope:
 
@@ -115,17 +128,34 @@ Resources default to `all`. Optional semantic filters remain available:
 ```bash
 uv run opik-to-bt \
   --projects support-bot \
-  --resources datasets,experiments,logs \
+  --resources datasets,experiments,logs,prompts \
   --datasets golden-set,edge-cases \
   --experiments baseline,v2 \
+  --prompts support-answer,route-request \
   --start 2026-01-01 \
   --end 2026-02-01
 ```
 
+Prompt history is intentionally opt-in:
+
+```bash
+uv run opik-to-bt \
+  --projects support-bot \
+  --resources prompts \
+  --prompt-history all
+```
+
+The equivalent persistent setting is `OPIK_TO_BT_PROMPT_HISTORY=all`. Without
+either setting, only the latest version of each selected prompt is migrated.
+
 No performance flags are required. Keep `.opik-to-bt/` when moving or
 restarting the job. Use `--no-resume` only when intentionally ignoring importer
-completion markers. This also starts fresh `bt sync` upload state; stable event
-IDs make the replay overwrite-safe.
+completion markers. This also starts fresh `bt sync` upload state; stable data
+event IDs make those row replays overwrite-safe. Prompt history depends on its
+checkpoint for ordering. A prompt already migrated in `latest` mode cannot be
+upgraded in place to `all`, because Braintrust cannot insert older versions
+before an existing version; use a new state directory and remove or rename the
+destination prompt first.
 
 ## Configuration
 
@@ -135,7 +165,8 @@ IDs make the replay overwrite-safe.
 | `OPIK_API_KEY` | — | Opik API key |
 | `OPIK_WORKSPACE` | — | Opik workspace |
 | `BRAINTRUST_URL` | `https://api.braintrust.dev` | Braintrust US/EU/self-hosted API |
-| `BRAINTRUST_API_KEY` | profile or environment | Braintrust authentication |
+| `BRAINTRUST_API_KEY` | profile or environment | Braintrust authentication; prompts and object-level tags require an API key |
+| `OPIK_TO_BT_PROMPT_HISTORY` | `latest` | Prompt version scope: `latest` or `all` |
 
 Operational overrides exist through `OPIK_TO_BT_*` environment variables for
 support and unusual deployments, but are deliberately omitted from the normal
@@ -213,6 +244,21 @@ must remain on its root volume.
 - Cross-object dataset origin IDs are omitted because the destination dataset
   ID is resolved internally by `bt sync`.
 - Source identifiers and unmapped context are retained under `metadata.opik`.
+- Opik text prompts become Braintrust completion prompts. Opik chat templates
+  are decoded from their stored JSON and become Braintrust chat messages.
+  Mustache remains Mustache; Jinja2 maps to Nunjucks, which is closely related
+  but not perfectly syntax-compatible. Unknown template languages are retained
+  as unrendered (`none`) templates.
+- Prompt names, descriptions, and tags are preserved. Braintrust slugs are
+  readable deterministic values with a suffix derived from the Opik prompt ID,
+  avoiding collisions between names that normalize to the same slug.
+- Opik's arbitrary per-version prompt metadata, original creator/timestamps,
+  commit, version number, and change description do not have corresponding
+  writable fields in Braintrust's public prompt-create schema. Source version
+  IDs and the returned Braintrust `_xact_id` values remain in the local
+  checkpoint. Opik environment assignments are not currently migrated.
+- `prompt_data.origin` is deliberately not used for Opik provenance because
+  Braintrust reserves it for references to other saved Braintrust prompts.
 
 Dataset version history is not included. A future opt-in mode could map Opik
 item history to Braintrust dataset snapshots.
@@ -229,13 +275,15 @@ environment first, then `.env`, then the defaults shown below.
 | Flag | Default | Controls |
 |---|---:|---|
 | `--projects NAME[,NAME...]` | All projects | Limits the migration to exact Opik project names. |
-| `--resources all\|datasets,experiments,logs` | `all` | Selects resource types. Any comma-separated subset of `datasets`, `experiments`, and `logs` is valid. |
+| `--resources all\|datasets,experiments,logs,prompts` | `all` | Selects resource types. Any comma-separated subset of `datasets`, `experiments`, `logs`, and `prompts` is valid. |
 | `--datasets NAME[,NAME...]` | All datasets | Limits datasets by exact name within the selected projects. This does not select experiments that reference an excluded dataset. |
 | `--experiments NAME[,NAME...]` | All experiments | Limits experiments by exact name within the selected projects. |
+| `--prompts NAME[,NAME...]` | All prompts | Limits prompts by exact name within the selected projects. |
+| `--prompt-history latest\|all` | `OPIK_TO_BT_PROMPT_HISTORY`, then `latest` | Migrates only each prompt's explicit latest version or replays every version oldest-to-newest. The CLI flag overrides the environment setting. |
 | `--start ISO-8601` | No lower bound | Inclusive UTC lower bound for experiment creation time and root-trace start time. A timezone-free value is interpreted as UTC. It does not filter datasets. |
 | `--end ISO-8601` | Run-start snapshot | Exclusive UTC upper bound for experiments and logs. When omitted, the run start is checkpointed and reused on resume so new Opik data cannot move the boundary. |
-| `--state-dir PATH` | `.opik-to-bt` | Stores the checkpoint, rolling NDJSON partitions, and `bt sync` state. Preserve this directory to resume, including when running in Docker or on another machine. |
-| `--resume` / `--no-resume` | `--resume` | Reuses importer checkpoints and `bt sync` state. `--no-resume` ignores importer completion markers and passes `--fresh` to `bt sync`; stable event IDs keep replay overwrite-safe. |
+| `--state-dir PATH` | `.opik-to-bt` | Stores the checkpoint, prompt-version map, rolling NDJSON partitions, and `bt sync` state. Preserve this directory to resume, including when running in Docker or on another machine. |
+| `--resume` / `--no-resume` | `--resume` | Reuses importer checkpoints, prompt-version mappings, and `bt sync` state. `--no-resume` ignores importer completion markers and passes `--fresh` to `bt sync`; stable row event IDs keep row replay overwrite-safe, but prompt history still requires a clean or matching destination. |
 | `--dry-run` / `--no-dry-run` | `--no-dry-run` | Inventories the selected scope without checking Braintrust authentication or writing destination data. |
 
 `--help`, `--install-completion`, and `--show-completion` are standard CLI
@@ -249,7 +297,7 @@ utility flags and do not affect migration behavior.
 | `OPIK_API_KEY` | Unset | Opik API key. |
 | `OPIK_WORKSPACE` | Unset | Opik workspace used by the SDK. |
 | `BRAINTRUST_URL` | `https://api.braintrust.dev` | Braintrust API base URL passed to `bt sync`. Set this for the EU endpoint or a self-hosted deployment. |
-| `BRAINTRUST_API_KEY` | Unset | Braintrust API key inherited by `bt sync`. When unset, `bt` uses its existing authenticated profile. |
+| `BRAINTRUST_API_KEY` | Unset | Braintrust API key inherited by `bt sync` and used for direct REST operations. When unset, `bt` can use its existing authenticated profile for row uploads, but prompts and object-level tags cannot be migrated. |
 
 ### Reliability and performance variables
 
@@ -260,7 +308,8 @@ from the runner's CPU, memory, and free staging disk.
 |---|---:|---|
 | `OPIK_TO_BT_TIMEOUT_SECONDS` | `60` | Per-request Opik HTTP timeout in seconds. Must be greater than zero. |
 | `OPIK_TO_BT_RETRY_ATTEMPTS` | `8` | Maximum total attempts for a retryable Opik request. The shared request gate honors server reset headers and applies bounded exponential backoff with jitter. |
-| `OPIK_TO_BT_PAGE_SIZE` | `2000` | Opik records requested per page (`1`–`2000`). The maximum minimizes API requests. Lower it only when the source response objects themselves are too large for the runner; transformed events are staged incrementally. Do not change it after a stream has checkpointed beyond page 1 unless starting fresh. |
+| `OPIK_TO_BT_PAGE_SIZE` | `2000` | Opik records requested per row-resource page (`1`–`2000`). Prompt listing and version-history requests are capped at their API limits of 1,000 and 100. Lower this only when source response objects are too large for the runner; transformed row events are staged incrementally. Do not change it after a row stream has checkpointed beyond page 1 unless starting fresh. |
+| `OPIK_TO_BT_PROMPT_HISTORY` | `latest` | Default for `--prompt-history`; set to `all` to opt into complete prompt-version replay. |
 | `OPIK_TO_BT_PARTITION_BYTES` | Automatic, up to `256 MiB` | Target uncompressed NDJSON bytes per immutable `bt sync` partition; override values are specified in bytes. The automatic value is bounded by memory and free disk; the effective minimum is `16 MiB`. Partitions rotate between events, so only a single event larger than the target can produce an oversized partition. |
 | `OPIK_TO_BT_RESOURCE_WORKERS` | `min(8, max(2, CPU/2))` | Maximum concurrent resource jobs and Opik request slots (`1`–`64`). Higher values improve extraction concurrency but increase API pressure and memory use. |
 | `OPIK_TO_BT_BUFFERED_PARTITIONS` | `2` | Ready-to-upload partition files buffered per active stream (`1`–`8`). Higher values allow more extraction/upload overlap at the cost of staging disk; partition contents are not held in memory. |

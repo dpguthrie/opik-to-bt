@@ -163,16 +163,18 @@ class OpikSource:
         /,
         *args: Any,
         start_page: int = 1,
+        request_size: int | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[Page]:
+        page_size = request_size or self.page_size
         page = start_page
-        seen = (start_page - 1) * self.page_size
+        seen = (start_page - 1) * page_size
         while True:
             response = await self._call(
                 function,
                 *args,
                 page=page,
-                size=self.page_size,
+                size=page_size,
                 request_options=self.request_options,
                 **kwargs,
             )
@@ -183,7 +185,7 @@ class OpikSource:
             total = raw.get("total") or raw.get("total_count")
             yield Page(page, content, int(total) if total is not None else None)
             seen += len(content)
-            if len(content) < self.page_size or (total is not None and seen >= int(total)):
+            if len(content) < page_size or (total is not None and seen >= int(total)):
                 return
             page += 1
 
@@ -237,6 +239,43 @@ class OpikSource:
 
     async def experiments(self, project_id: str) -> list[Any]:
         return await self._collect(self.experiment_pages(project_id))
+
+    async def prompt_pages(self, project_id: str, *, start_page: int = 1) -> AsyncIterator[Page]:
+        async for page in self._page_stream(
+            self.client.rest_client.prompts.get_prompts,
+            project_id=project_id,
+            start_page=start_page,
+            request_size=min(self.page_size, 1000),
+        ):
+            yield page
+
+    async def prompts(self, project_id: str) -> list[Any]:
+        return await self._collect(self.prompt_pages(project_id))
+
+    async def prompt_detail(self, prompt_id: str) -> Any:
+        return await self._call(
+            self.client.rest_client.prompts.get_prompt_by_id,
+            prompt_id,
+            request_options=self.request_options,
+        )
+
+    async def prompt_version_pages(
+        self, prompt_id: str, *, start_page: int = 1
+    ) -> AsyncIterator[Page]:
+        async for page in self._page_stream(
+            self.client.rest_client.prompts.get_prompt_versions,
+            prompt_id,
+            start_page=start_page,
+            request_size=min(self.page_size, 100),
+        ):
+            yield page
+
+    async def prompt_versions(self, prompt_id: str) -> list[Any]:
+        # Opik returns versions newest-first. Braintrust history must be created
+        # chronologically so that the final destination snapshot is the latest.
+        versions = await self._collect(self.prompt_version_pages(prompt_id))
+        versions.reverse()
+        return versions
 
     async def experiment_item_pages(
         self,
