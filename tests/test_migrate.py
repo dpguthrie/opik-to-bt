@@ -1,8 +1,11 @@
 import json
 from datetime import UTC, datetime
 
+import pytest
+
 from opik_to_bt.checkpoint import Checkpoint
-from opik_to_bt.config import Resource
+from opik_to_bt.config import PromptHistory, Resource
+from opik_to_bt.mapping import prompt_definition
 from opik_to_bt.migrate import Migrator, Selection
 from opik_to_bt.pipeline import Page
 from opik_to_bt.tuning import RuntimeTuning
@@ -247,3 +250,164 @@ async def test_implicit_end_reuses_checkpoint_snapshot(tmp_path) -> None:
     ).run(selection)
 
     assert selection.end == datetime(2026, 3, 1, 12, tzinfo=UTC)
+
+
+class PromptSource:
+    def __init__(self) -> None:
+        self.container = {
+            "id": "prompt-1",
+            "name": "Greeting",
+            "description": "A greeting",
+            "template_structure": "text",
+            "tags": ["shared"],
+        }
+        self.history = [
+            {"id": "version-1", "template": "Hello", "type": "mustache"},
+            {"id": "version-2", "template": "Hello {{name}}", "type": "mustache"},
+        ]
+
+    async def projects(self):
+        return [{"id": "project-1", "name": "selected"}]
+
+    async def prompts(self, project_id):
+        del project_id
+        return [self.container]
+
+    async def prompt_detail(self, prompt_id):
+        del prompt_id
+        return {"latest_version": self.history[-1]}
+
+    async def prompt_versions(self, prompt_id):
+        del prompt_id
+        return self.history
+
+
+class PromptTarget:
+    def __init__(self) -> None:
+        self.current = None
+        self.writes = []
+        self.next_version = 1
+
+    async def check(self):
+        return None
+
+    async def create_project(self, name, description):
+        del name, description
+        return "bt-project"
+
+    async def get_prompt(self, project_id, slug):
+        del project_id, slug
+        return self.current
+
+    async def write_prompt(self, project_id, definition, *, update):
+        del project_id
+        version = self.next_version
+        self.next_version += 1
+        self.current = {
+            "id": "bt-prompt",
+            "_xact_id": f"xact-{version}",
+            **definition,
+        }
+        self.writes.append((update, definition))
+        return self.current
+
+
+def prompt_selection(history: PromptHistory) -> Selection:
+    return Selection(
+        resources={Resource.PROMPTS},
+        projects=None,
+        datasets=None,
+        experiments=None,
+        start=None,
+        end=None,
+        prompt_history=history,
+    )
+
+
+async def test_latest_prompt_mode_writes_only_latest_and_resumes(tmp_path) -> None:
+    source, target = PromptSource(), PromptTarget()
+    checkpoint = Checkpoint(tmp_path / "checkpoint.json")
+    migrator = Migrator(source, target, checkpoint)
+
+    await migrator.run(prompt_selection(PromptHistory.LATEST))
+    await migrator.run(prompt_selection(PromptHistory.LATEST))
+
+    assert len(target.writes) == 1
+    update, definition = target.writes[0]
+    assert update is False
+    assert definition["prompt_data"]["prompt"]["content"] == "Hello {{name}}"
+    assert checkpoint.value("prompt:prompt-1:versions") == {"version-2": "xact-1"}
+    assert checkpoint.completed("prompt:prompt-1:latest")
+
+
+async def test_all_prompt_history_replays_oldest_to_newest(tmp_path) -> None:
+    source, target = PromptSource(), PromptTarget()
+    checkpoint = Checkpoint(tmp_path / "checkpoint.json")
+
+    await Migrator(source, target, checkpoint).run(prompt_selection(PromptHistory.ALL))
+
+    assert [update for update, _ in target.writes] == [False, True]
+    assert [definition["prompt_data"]["prompt"]["content"] for _, definition in target.writes] == [
+        "Hello",
+        "Hello {{name}}",
+    ]
+    assert checkpoint.value("prompt:prompt-1:versions") == {
+        "version-1": "xact-1",
+        "version-2": "xact-2",
+    }
+    assert checkpoint.completed("prompt:prompt-1:all")
+
+
+async def test_all_prompt_history_keeps_identical_versions_distinct(tmp_path) -> None:
+    source, target = PromptSource(), PromptTarget()
+    source.history[1]["template"] = source.history[0]["template"]
+
+    await Migrator(source, target, Checkpoint(tmp_path / "checkpoint.json")).run(
+        prompt_selection(PromptHistory.ALL)
+    )
+
+    assert [update for update, _ in target.writes] == [False, True]
+
+
+async def test_latest_to_all_mode_change_is_rejected(tmp_path) -> None:
+    source, target = PromptSource(), PromptTarget()
+    migrator = Migrator(source, target, Checkpoint(tmp_path / "checkpoint.json"))
+    await migrator.run(prompt_selection(PromptHistory.LATEST))
+
+    with pytest.raises(RuntimeError, match="already migrated in latest-only mode"):
+        await migrator.run(prompt_selection(PromptHistory.ALL))
+
+
+async def test_prompt_resume_rejects_destination_change_after_final_write(tmp_path) -> None:
+    source, target = PromptSource(), PromptTarget()
+    checkpoint = Checkpoint(tmp_path / "checkpoint.json")
+    await Migrator(source, target, checkpoint).run(prompt_selection(PromptHistory.ALL))
+
+    checkpoint.data["completed"].remove("prompt:prompt-1:all")
+    checkpoint.save()
+    target.current["_xact_id"] = "manual-edit"
+
+    with pytest.raises(RuntimeError, match="changed after its last checkpoint"):
+        await Migrator(source, target, checkpoint).run(prompt_selection(PromptHistory.ALL))
+
+
+async def test_prompt_resume_recovers_write_before_checkpoint(tmp_path) -> None:
+    source, target = PromptSource(), PromptTarget()
+    checkpoint = Checkpoint(tmp_path / "checkpoint.json")
+    slug = "greeting-2c7e2d3a"
+    first_definition = {
+        **prompt_definition(source.container, source.history[0]),
+        "slug": slug,
+    }
+    target.current = {"id": "bt-prompt", "_xact_id": "xact-1", **first_definition}
+    target.next_version = 2
+    checkpoint.set_value("prompt:prompt-1:mode", "all")
+    checkpoint.set_value("prompt:prompt-1:slug", slug)
+
+    await Migrator(source, target, checkpoint).run(prompt_selection(PromptHistory.ALL))
+
+    assert [update for update, _ in target.writes] == [True]
+    assert checkpoint.value("prompt:prompt-1:versions") == {
+        "version-1": "xact-1",
+        "version-2": "xact-2",
+    }

@@ -23,6 +23,13 @@ Inside the session, place credentials in `/opt/opik-to-bt/.env` (mode `0600`)
 or export them from your existing secret-management workflow, then run the same
 commands documented in the main README.
 
+Prompt migration requires `BRAINTRUST_API_KEY`; a saved `bt` profile is not
+enough for the versioned prompt REST calls. Prompt history defaults to the
+latest Opik version. Set `OPIK_TO_BT_PROMPT_HISTORY=all` or pass
+`--prompt-history all` to replay every version oldest-to-newest. Keep the
+runner's `.opik-to-bt/` directory because it stores the source-version to
+Braintrust `_xact_id` mapping needed for safe resume.
+
 API keys are intentionally not Terraform variables, so they do not enter
 Terraform state. For production, attach a narrowly scoped Secrets Manager read
 policy to the instance role and retrieve the secrets at runtime.

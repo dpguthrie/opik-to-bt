@@ -7,8 +7,15 @@ from datetime import UTC, datetime
 from typing import Any
 
 from opik_to_bt.checkpoint import Checkpoint
-from opik_to_bt.config import Resource, parse_datetime
-from opik_to_bt.mapping import dataset_event, experiment_events, span_event, trace_event
+from opik_to_bt.config import PromptHistory, Resource, parse_datetime
+from opik_to_bt.mapping import (
+    dataset_event,
+    experiment_events,
+    prompt_definition,
+    prompt_slug,
+    span_event,
+    trace_event,
+)
 from opik_to_bt.pipeline import Page, Partition, bounded_gather, run_partitioned
 from opik_to_bt.progress import MigrationProgress
 from opik_to_bt.tuning import RuntimeTuning
@@ -23,6 +30,8 @@ class Selection:
     experiments: set[str] | None
     start: datetime | None
     end: datetime | None
+    prompts: set[str] | None = None
+    prompt_history: PromptHistory = PromptHistory.LATEST
     dry_run: bool = False
 
 
@@ -140,11 +149,184 @@ class Migrator:
                     selection,
                 )
             )
+        if Resource.PROMPTS in selection.resources:
+            independent.append(self._prompts(source_project_id, target_project_id, selection))
         if independent:
             await asyncio.gather(*independent)
         # Keep related datasets available before their experiment results.
         if Resource.EXPERIMENTS in selection.resources:
             await self._experiments(source_project_id, target_project_id, selection)
+
+    @staticmethod
+    def _prompt_version_id(version: Any) -> str:
+        raw = as_dict(version)
+        version_id = raw.get("id") or raw.get("version_number") or raw.get("commit")
+        if not version_id:
+            raise RuntimeError("Opik returned a prompt version without an identifier")
+        return str(version_id)
+
+    @staticmethod
+    def _prompt_matches(current: dict[str, Any], definition: dict[str, Any]) -> bool:
+        fields = ("name", "slug", "description", "prompt_data")
+        return all(current.get(field) == definition.get(field) for field in fields) and (
+            current.get("tags") or []
+        ) == (definition.get("tags") or [])
+
+    async def _prompts(
+        self, source_project_id: str, target_project_id: str, selection: Selection
+    ) -> None:
+        prompts = [
+            item
+            for item in await self.source.prompts(source_project_id)
+            if selected(as_dict(item)["name"], selection.prompts)
+        ]
+        await bounded_gather(
+            prompts,
+            lambda prompt: self._resource(
+                self._prompt,
+                prompt,
+                target_project_id,
+                selection.prompt_history,
+            ),
+            self.tuning.resource_workers,
+        )
+
+    async def _prompt(
+        self,
+        prompt: Any,
+        target_project_id: str,
+        history: PromptHistory,
+    ) -> None:
+        raw = as_dict(prompt)
+        source_prompt_id = str(raw["id"])
+        mode_key = f"prompt:{source_prompt_id}:mode"
+        stored_mode = self.checkpoint.value(mode_key)
+        if stored_mode == PromptHistory.LATEST and history == PromptHistory.ALL:
+            raise RuntimeError(
+                f"Prompt {raw['name']!r} was already migrated in latest-only mode. "
+                "Its older versions cannot be inserted before the existing Braintrust version; "
+                "use a new state directory and remove or rename the destination prompt first."
+            )
+
+        all_complete = self.checkpoint.completed(f"prompt:{source_prompt_id}:all")
+        completion_key = f"prompt:{source_prompt_id}:{history.value}"
+        if self.checkpoint.completed(completion_key) or (
+            history == PromptHistory.LATEST and all_complete
+        ):
+            self.progress.checkpointed(f"prompt {raw['name']}")
+            return
+
+        if stored_mode is None or history == PromptHistory.ALL:
+            self.checkpoint.set_value(mode_key, history.value)
+
+        task = self.progress.start(f"prompt · {raw['name']}")
+        if history == PromptHistory.ALL:
+            versions = await self.source.prompt_versions(source_prompt_id)
+        else:
+            detail = as_dict(await self.source.prompt_detail(source_prompt_id))
+            latest = detail.get("latest_version")
+            versions = [latest] if latest is not None else []
+
+        if not versions:
+            self.checkpoint.mark_completed(completion_key)
+            self.progress.complete(task, items=0, partitions=0)
+            return
+
+        slug_key = f"prompt:{source_prompt_id}:slug"
+        slug = self.checkpoint.value(slug_key) or prompt_slug(raw["name"], source_prompt_id)
+        self.checkpoint.set_value(slug_key, slug)
+        current = await self.target.get_prompt(target_project_id, slug)
+        target_id = self.checkpoint.target("prompt", source_prompt_id)
+        if current is None and target_id:
+            raise RuntimeError(
+                f"Checkpointed Braintrust prompt {target_id!r} for {raw['name']!r} no longer exists"
+            )
+        if current and target_id and str(current["id"]) != target_id:
+            raise RuntimeError(
+                f"Braintrust prompt slug {slug!r} no longer resolves to the checkpointed prompt"
+            )
+
+        versions_key = f"prompt:{source_prompt_id}:versions"
+        migrated_versions = dict(self.checkpoint.value(versions_key) or {})
+        source_version_ids = [self._prompt_version_id(version) for version in versions]
+        mapped_ids = [
+            version_id for version_id in source_version_ids if version_id in migrated_versions
+        ]
+        if history == PromptHistory.ALL:
+            unexpected_ids = set(migrated_versions) - set(source_version_ids)
+            if unexpected_ids:
+                raise RuntimeError(
+                    f"Prompt history for {raw['name']!r} no longer contains checkpointed "
+                    f"version(s): {', '.join(sorted(unexpected_ids))}"
+                )
+            if mapped_ids != source_version_ids[: len(mapped_ids)]:
+                raise RuntimeError(
+                    f"Prompt history checkpoint for {raw['name']!r} is not a chronological prefix"
+                )
+
+        recovery_candidate = current is not None
+        if mapped_ids:
+            if current is None:
+                raise RuntimeError(
+                    f"Braintrust prompt {slug!r} is missing after checkpointed history writes"
+                )
+            expected_current_version = migrated_versions[mapped_ids[-1]]
+            if str(current.get("_xact_id")) == str(expected_current_version):
+                # The last checkpointed write is still current. Even if the next
+                # source version has identical content, it needs its own PUT.
+                recovery_candidate = False
+            elif len(mapped_ids) == len(source_version_ids):
+                raise RuntimeError(
+                    f"Braintrust prompt {slug!r} changed after its last checkpoint; "
+                    "refusing to mark unexpected content as migrated."
+                )
+
+        for index, version in enumerate(versions, start=1):
+            source_version_id = self._prompt_version_id(version)
+            if source_version_id in migrated_versions:
+                continue
+            definition = {
+                **prompt_definition(prompt, version),
+                "slug": slug,
+            }
+            self.progress.detail(task, f"version {index}/{len(versions)}")
+
+            matches_current = current is not None and self._prompt_matches(current, definition)
+            if matches_current and (history == PromptHistory.LATEST or recovery_candidate):
+                written = current
+            else:
+                if (
+                    history == PromptHistory.ALL
+                    and recovery_candidate
+                    and current is not None
+                    and migrated_versions
+                ):
+                    raise RuntimeError(
+                        f"Braintrust prompt {slug!r} changed after its last checkpoint; "
+                        "refusing to append history to an unexpected version."
+                    )
+                if history == PromptHistory.ALL and current is not None and not migrated_versions:
+                    raise RuntimeError(
+                        f"Braintrust prompt {slug!r} already exists with content that does not "
+                        "match the oldest Opik version; refusing to create incorrectly ordered "
+                        "history."
+                    )
+                written = await self.target.write_prompt(
+                    target_project_id,
+                    definition,
+                    update=current is not None,
+                )
+
+            target_id = str(written["id"])
+            target_version = str(written["_xact_id"])
+            self.checkpoint.set_target("prompt", source_prompt_id, target_id)
+            migrated_versions[source_version_id] = target_version
+            self.checkpoint.set_value(versions_key, migrated_versions)
+            current = written
+            recovery_candidate = False
+
+        self.checkpoint.mark_completed(completion_key)
+        self.progress.complete(task, items=len(versions), partitions=0)
 
     async def _datasets(
         self, source_project_id: str, target_project_id: str, selection: Selection
@@ -391,4 +573,13 @@ class Migrator:
                 parts.append(f"{len(experiments)} experiment(s)")
             if Resource.LOGS in selection.resources:
                 parts.append("logs in selected date range")
+            if Resource.PROMPTS in selection.resources:
+                prompts = [
+                    item
+                    for item in await self.source.prompts(raw["id"])
+                    if selected(as_dict(item)["name"], selection.prompts)
+                ]
+                parts.append(
+                    f"{len(prompts)} prompt(s), {selection.prompt_history.value} version mode"
+                )
             self.progress.message(f"  {raw['name']}: {', '.join(parts)}")

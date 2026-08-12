@@ -117,3 +117,35 @@ async def test_span_pages_bulk_export_omits_trace_id_filter() -> None:
     ] == []
     assert captured["project_name"] == "project"
     assert "trace_id" not in captured
+
+
+async def test_prompt_versions_are_returned_oldest_first() -> None:
+    source = object.__new__(OpikSource)
+    source.page_size = 2
+    source.request_options = {}
+
+    class Prompts:
+        @staticmethod
+        def get_prompt_versions(prompt_id, *, page, size, request_options):
+            del prompt_id, size, request_options
+            pages = {
+                1: {"content": [{"id": "v3"}, {"id": "v2"}], "total": 3},
+                2: {"content": [{"id": "v1"}], "total": 3},
+            }
+            return pages[page]
+
+    class RestClient:
+        prompts = Prompts()
+
+    class Client:
+        rest_client = RestClient()
+
+    source.client = Client()
+
+    async def call(function, /, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    source._call = call
+
+    versions = await source.prompt_versions("prompt-1")
+    assert [version["id"] for version in versions] == ["v1", "v2", "v3"]

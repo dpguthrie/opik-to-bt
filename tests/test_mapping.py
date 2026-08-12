@@ -3,10 +3,68 @@ import pytest
 from opik_to_bt.mapping import (
     dataset_event,
     experiment_events,
+    prompt_definition,
+    prompt_slug,
     span_event,
     trace_event,
     trace_events,
 )
+
+
+def test_text_prompt_maps_to_braintrust_completion() -> None:
+    definition = prompt_definition(
+        {
+            "id": "prompt-1",
+            "name": "Support Answer",
+            "description": "Answer support questions",
+            "template_structure": "text",
+            "tags": ["support"],
+        },
+        {
+            "id": "version-2",
+            "template": "Answer {{question}}",
+            "type": "mustache",
+        },
+    )
+
+    assert definition == {
+        "name": "Support Answer",
+        "description": "Answer support questions",
+        "prompt_data": {
+            "prompt": {"type": "completion", "content": "Answer {{question}}"},
+            "template_format": "mustache",
+        },
+        "tags": ["support"],
+    }
+    assert prompt_slug("Support Answer", "prompt-1").startswith("support-answer-")
+
+
+def test_chat_prompt_maps_json_messages_and_jinja_to_nunjucks() -> None:
+    definition = prompt_definition(
+        {"name": "Chat", "template_structure": "chat", "tags": ["container"]},
+        {
+            "template": '[{"role":"system","content":"Hello {{ name }}"}]',
+            "type": "jinja2",
+            "tags": ["version"],
+        },
+    )
+
+    assert definition["prompt_data"] == {
+        "prompt": {
+            "type": "chat",
+            "messages": [{"role": "system", "content": "Hello {{ name }}"}],
+        },
+        "template_format": "nunjucks",
+    }
+    assert definition["tags"] == ["version"]
+
+
+def test_invalid_chat_prompt_is_rejected() -> None:
+    with pytest.raises(ValueError, match="invalid message JSON"):
+        prompt_definition(
+            {"name": "Broken", "template_structure": "chat"},
+            {"template": "not-json", "type": "mustache"},
+        )
 
 
 def test_dataset_and_experiment_mapping() -> None:

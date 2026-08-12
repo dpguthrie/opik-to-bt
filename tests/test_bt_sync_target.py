@@ -65,6 +65,53 @@ async def test_apply_tags_skips_objects_that_were_never_uploaded(tmp_path) -> No
     assert requests == ["GET"]
 
 
+async def test_prompt_writes_resolve_real_project_and_use_rest_api(tmp_path) -> None:
+    requests = []
+    target = BtSyncTarget(tmp_path, settings())
+    project = await target.create_project("my project", "Migrated from Opik")
+
+    def fake_request(method, path, payload=None):
+        requests.append((method, path, payload))
+        if path.startswith("/v1/project?"):
+            return {"objects": []}
+        if path == "/v1/project":
+            return {"id": "project-1"}
+        if method == "GET":
+            return {"objects": []}
+        return {"id": "prompt-1", "_xact_id": "xact-1", **payload}
+
+    target._request = fake_request
+    definition = {
+        "name": "Greeting",
+        "slug": "greeting-12345678",
+        "prompt_data": {
+            "prompt": {"type": "completion", "content": "Hello"},
+            "template_format": "mustache",
+        },
+    }
+
+    assert await target.get_prompt(project, definition["slug"]) is None
+    written = await target.write_prompt(project, definition, update=False)
+    await target.write_prompt(project, definition, update=True)
+
+    assert written["id"] == "prompt-1"
+    assert requests == [
+        ("GET", "/v1/project?project_name=my+project", None),
+        (
+            "POST",
+            "/v1/project",
+            {"name": "my project", "description": "Migrated from Opik"},
+        ),
+        (
+            "GET",
+            "/v1/prompt?project_id=project-1&slug=greeting-12345678",
+            None,
+        ),
+        ("POST", "/v1/prompt", {"project_id": "project-1", **definition}),
+        ("PUT", "/v1/prompt", {"project_id": "project-1", **definition}),
+    ]
+
+
 async def test_each_partition_gets_independent_bt_sync_state(tmp_path, monkeypatch) -> None:
     commands = []
 
