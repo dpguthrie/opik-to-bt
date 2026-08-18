@@ -733,3 +733,117 @@ async def test_thread_queues_flag_traces_in_the_thread(tmp_path) -> None:
 
     assert [event["id"] for event in target.flagged] == ["opik:trace:trace-a"]
     assert target.view_writes[0][1]["options"]["grouping"] == "metadata.thread_id"
+
+
+class DashboardSource:
+    def __init__(self, dashboards) -> None:
+        self._dashboards = dashboards
+
+    async def projects(self):
+        return [{"id": "project-1", "name": "selected"}]
+
+    async def dashboards(self, project_id=None):
+        if project_id is None:
+            return [item for item in self._dashboards if not as_dict_trace(item).get("project_id")]
+        return [
+            item
+            for item in self._dashboards
+            if as_dict_trace(item).get("project_id") in (None, project_id)
+        ]
+
+
+def _dashboard(**overrides):
+    item = {
+        "id": "dash-1",
+        "name": "Prod overview",
+        "type": "multi_project",
+        "scope": "workspace",
+        "config": {
+            "sections": [
+                {
+                    "widgets": [
+                        {
+                            "id": "w-traces",
+                            "type": "project_metrics",
+                            "title": "Trace volume",
+                            "config": {"metricType": "TRACE_COUNT"},
+                        },
+                        {
+                            "id": "w-notes",
+                            "type": "text_markdown",
+                            "title": "Notes",
+                            "config": {"content": "n/a"},
+                        },
+                    ]
+                }
+            ]
+        },
+    }
+    item.update(overrides)
+    return item
+
+
+async def test_dashboards_write_monitor_views_and_resume(tmp_path) -> None:
+    source = DashboardSource([_dashboard()])
+    target = ScorerTarget()
+    checkpoint = Checkpoint(tmp_path / "checkpoint.json")
+
+    await Migrator(source, target, checkpoint).run(scorer_selection(Resource.DASHBOARDS))
+    await Migrator(source, target, checkpoint).run(scorer_selection(Resource.DASHBOARDS))
+
+    assert len(target.view_writes) == 1
+    _, payload = target.view_writes[0]
+    assert payload["view_type"] == "monitor"
+    assert payload["view_data"]["custom_charts"][0]["measures"] == ["count(id)"]
+    assert checkpoint.completed("dashboard:project-1:dash-1")
+
+
+async def test_experiment_dashboards_are_inventoried_not_written(tmp_path) -> None:
+    source = DashboardSource([_dashboard(type="experiments")])
+    target = ScorerTarget()
+    checkpoint = Checkpoint(tmp_path / "checkpoint.json")
+
+    await Migrator(source, target, checkpoint).run(scorer_selection(Resource.DASHBOARDS))
+
+    assert getattr(target, "view_writes", []) == []
+    assert checkpoint.completed("dashboard:project-1:dash-1")
+
+
+async def test_dry_run_inventories_dashboard_widgets(tmp_path) -> None:
+    class Capture:
+        def __init__(self) -> None:
+            self.lines: list[str] = []
+
+        def message(self, message: str) -> None:
+            self.lines.append(message)
+
+    source = DashboardSource(
+        [
+            _dashboard(),
+            _dashboard(id="dash-2", name="Eval board", type="experiments"),
+        ]
+    )
+    progress = Capture()
+    await Migrator(
+        source,
+        object(),
+        Checkpoint(tmp_path / "checkpoint.json"),
+        progress=progress,
+    ).run(
+        Selection(
+            resources={Resource.DASHBOARDS},
+            projects=None,
+            datasets=None,
+            experiments=None,
+            start=None,
+            end=None,
+            dry_run=True,
+        )
+    )
+    joined = "\n".join(progress.lines)
+    assert "2 dashboard(s)" in joined
+    assert "Prod overview (multi_project/workspace): translate" in joined
+    assert "Eval board (experiments/workspace): skipped" in joined
+    assert "widget Trace volume: timeseries count(id)" in joined
+    assert "markdown is not a Monitor chart" in joined
+    assert "Custom charts require a Braintrust Pro or Enterprise plan" in joined

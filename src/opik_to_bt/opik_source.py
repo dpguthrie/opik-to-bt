@@ -412,6 +412,30 @@ class OpikSource:
     async def annotation_queues(self, project_id: str) -> list[Any]:
         return await self._collect(self.annotation_queue_pages(project_id))
 
+    async def dashboard_pages(
+        self, project_id: str | None = None, *, start_page: int = 1
+    ) -> AsyncIterator[Page]:
+        client = getattr(self.client.rest_client, "dashboards", None)
+        find = getattr(client, "find_dashboards", None) if client else None
+        if find is None:
+            raise RuntimeError(
+                "This Opik SDK does not expose dashboards. "
+                "Upgrade the opik package to migrate Monitor views."
+            )
+        kwargs: dict[str, Any] = {}
+        if project_id:
+            kwargs["project_id"] = project_id
+        async for page in self._page_stream(
+            find,
+            start_page=start_page,
+            request_size=min(self.page_size, 1000),
+            **kwargs,
+        ):
+            yield page
+
+    async def dashboards(self, project_id: str | None = None) -> list[Any]:
+        return await self._collect(self.dashboard_pages(project_id))
+
     async def annotation_queue_trace_pages(
         self, project_id: str, queue_id: str, *, start_page: int = 1
     ) -> AsyncIterator[Page]:

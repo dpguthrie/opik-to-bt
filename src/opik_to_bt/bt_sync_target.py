@@ -171,11 +171,18 @@ class BtSyncTarget:
         update: bool,
     ) -> dict[str, Any]:
         project_id = await self._prompt_project_id(project_handle)
+        payload = {"object_id": project_id, **definition}
+        if str(definition.get("view_type") or "") == "monitor":
+            options = dict(definition.get("options") or {})
+            nested = dict(options.get("options") or {})
+            nested.setdefault("type", "project")
+            nested["projectId"] = project_id
+            payload["options"] = {**options, "viewType": "monitor", "options": nested}
         return await asyncio.to_thread(
             self._request,
             "PUT" if update else "POST",
             "/v1/view",
-            {"object_id": project_id, **definition},
+            payload,
         )
 
     async def flag_logs_for_review(self, project_handle: str, events: list[dict[str, Any]]) -> None:
@@ -255,9 +262,9 @@ class BtSyncTarget:
         api_key = self.api_key or os.environ.get("BRAINTRUST_API_KEY")
         if not api_key:
             raise RuntimeError(
-                "Prompt, scorer, online-eval, review-score, and annotation-queue "
-                "migration need BRAINTRUST_API_KEY; `bt` login profiles do not cover "
-                "direct Braintrust REST calls."
+                "Prompt, scorer, online-eval, review-score, annotation-queue, and "
+                "dashboard migration need BRAINTRUST_API_KEY; `bt` login profiles "
+                "do not cover direct Braintrust REST calls."
             )
         request = urllib.request.Request(
             f"{self.api_url}{path}",

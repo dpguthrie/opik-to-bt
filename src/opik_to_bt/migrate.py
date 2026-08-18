@@ -9,6 +9,7 @@ from typing import Any
 from opik_to_bt.checkpoint import Checkpoint
 from opik_to_bt.config import PromptHistory, Resource, parse_datetime
 from opik_to_bt.mapping import (
+    dashboard_view_payload,
     dataset_event,
     evaluator_scope,
     evaluator_type,
@@ -44,6 +45,7 @@ class Selection:
     online_evals: set[str] | None = None
     review_scores: set[str] | None = None
     annotation_queues: set[str] | None = None
+    dashboards: set[str] | None = None
     dry_run: bool = False
 
 
@@ -139,6 +141,13 @@ class Migrator:
                 "Awaiting review in Braintrust. Reviewers are not auto-assigned. "
                 "Omit annotation-queues to copy review-score widgets without the backlog."
             )
+        if Resource.DASHBOARDS in selection.resources:
+            self.progress.message(
+                "Monitor views are written with generated custom charts. Custom "
+                "charts require a Braintrust Pro or Enterprise plan. Experiment "
+                "dashboards, radar charts, markdown, and Insights overviews are "
+                "inventoried and skipped."
+            )
         if selection.dry_run:
             await self._inventory(projects, selection)
             return
@@ -188,6 +197,8 @@ class Migrator:
             await self._online_evals(source_project_id, target_project_id, selection)
         if Resource.ANNOTATION_QUEUES in selection.resources:
             await self._annotation_queues(source_project_id, target_project_id, selection)
+        if Resource.DASHBOARDS in selection.resources:
+            await self._dashboards(source_project_id, target_project_id, selection)
 
     @staticmethod
     def _prompt_version_id(version: Any) -> str:
@@ -237,8 +248,12 @@ class Migrator:
 
     @staticmethod
     def _view_matches(current: dict[str, Any], definition: dict[str, Any]) -> bool:
-        fields = ("name", "view_type", "view_data", "options")
-        return all(current.get(field) == definition.get(field) for field in fields)
+        fields = ("name", "view_type", "view_data")
+        if not all(current.get(field) == definition.get(field) for field in fields):
+            return False
+        if definition.get("view_type") == "monitor":
+            return True
+        return current.get("options") == definition.get("options")
 
     async def _prompts(
         self, source_project_id: str, target_project_id: str, selection: Selection
@@ -637,6 +652,84 @@ class Migrator:
         traces = await self.source.annotation_queue_traces(source_project_id, queue_id)
         return [str(as_dict(trace)["id"]) for trace in traces]
 
+    async def _listed_dashboards(self, source_project_id: str) -> list[Any]:
+        cached = getattr(self, "_cached_dashboards", None)
+        workspace = getattr(self, "_cached_workspace_dashboards", None)
+        if workspace is None:
+            self._cached_workspace_dashboards = await self.source.dashboards()
+            workspace = self._cached_workspace_dashboards
+        if cached is None:
+            self._cached_dashboards = {}
+            cached = self._cached_dashboards
+        if source_project_id not in cached:
+            cached[source_project_id] = await self.source.dashboards(source_project_id)
+        seen: dict[str, Any] = {}
+        for dashboard in [*workspace, *cached[source_project_id]]:
+            raw = as_dict(dashboard)
+            owner = raw.get("project_id")
+            if owner not in (None, "", source_project_id):
+                continue
+            seen[str(raw.get("id") or raw.get("name"))] = dashboard
+        return list(seen.values())
+
+    async def _dashboards(
+        self, source_project_id: str, target_project_id: str, selection: Selection
+    ) -> None:
+        dashboards = [
+            item
+            for item in await self._listed_dashboards(source_project_id)
+            if selected(as_dict(item)["name"], selection.dashboards)
+        ]
+        await bounded_gather(
+            dashboards,
+            lambda dashboard: self._resource(
+                self._dashboard, dashboard, source_project_id, target_project_id
+            ),
+            self.tuning.resource_workers,
+        )
+
+    async def _dashboard(
+        self, dashboard: Any, source_project_id: str, target_project_id: str
+    ) -> None:
+        raw = as_dict(dashboard)
+        source_id = str(raw.get("id") or raw["name"])
+        completion_key = f"dashboard:{source_project_id}:{source_id}"
+        if self.checkpoint.completed(completion_key):
+            self.progress.checkpointed(f"dashboard {raw['name']}")
+            return
+
+        payload, skip, notes = dashboard_view_payload(dashboard)
+        for note in notes:
+            if "skipped" in note:
+                self.progress.message(f"  dashboard {raw['name']}: {note}")
+        if skip:
+            self.progress.message(f"  dashboard {raw['name']}: skipped — {skip}")
+            self.checkpoint.mark_completed(completion_key)
+            return
+        assert payload is not None
+        if raw.get("project_id") in (None, ""):
+            self.progress.message(
+                f"  dashboard {raw['name']}: workspace dashboard copied into this project"
+            )
+
+        current = await self.target.get_view(
+            target_project_id, payload["name"], view_type=payload["view_type"]
+        )
+        if current is not None and self._view_matches(current, payload):
+            written = current
+        else:
+            written = await self.target.write_view(
+                target_project_id,
+                payload,
+                update=current is not None,
+            )
+        self.checkpoint.set_target(
+            "dashboard", f"{source_project_id}:{source_id}", str(written["id"])
+        )
+        self.checkpoint.mark_completed(completion_key)
+        task = self.progress.start(f"dashboard · {raw['name']}")
+        self.progress.complete(task, items=len(payload["view_data"]["custom_charts"]), partitions=0)
+
     async def _datasets(
         self, source_project_id: str, target_project_id: str, selection: Selection
     ) -> None:
@@ -908,6 +1001,10 @@ class Migrator:
                 )
                 extra.extend(queue_extra)
                 details.extend(queue_details)
+            if Resource.DASHBOARDS in selection.resources:
+                dash_extra, dash_details = await self._inventory_dashboards(raw["id"], selection)
+                extra.extend(dash_extra)
+                details.extend(dash_details)
             parts.extend(extra)
             self.progress.message(f"  {raw['name']}: {', '.join(parts)}")
             for line in details:
@@ -988,3 +1085,23 @@ class Migrator:
                 f"review view + flag {count_text}{scores}"
             )
         return [f"{len(queues)} annotation queue(s)"], details
+
+    async def _inventory_dashboards(
+        self, source_project_id: str, selection: Selection
+    ) -> tuple[list[str], list[str]]:
+        dashboards = [
+            item
+            for item in await self._listed_dashboards(source_project_id)
+            if selected(as_dict(item)["name"], selection.dashboards)
+        ]
+        details = []
+        for dashboard in dashboards:
+            raw = as_dict(dashboard)
+            _, skip, notes = dashboard_view_payload(dashboard)
+            kind = raw.get("type") or "unknown"
+            scope = raw.get("scope") or "workspace"
+            status = f"skipped — {skip}" if skip else "translate"
+            details.append(f"    {raw['name']} ({kind}/{scope}): {status}")
+            for note in notes:
+                details.append(f"      widget {note}")
+        return [f"{len(dashboards)} dashboard(s)"], details

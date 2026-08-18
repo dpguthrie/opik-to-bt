@@ -185,13 +185,54 @@ async def test_view_and_review_flag_writes_use_rest_api(tmp_path) -> None:
     await target.write_view(project, view, update=True)
     await target.flag_logs_for_review(project, events)
 
-    assert ("POST", "/v1/view", {"object_id": "project-1", **view}) in requests
-    assert ("PUT", "/v1/view", {"object_id": "project-1", **view}) in requests
+    assert (
+        "POST",
+        "/v1/view",
+        {"object_id": "project-1", **view},
+    ) in requests
+    assert (
+        "PUT",
+        "/v1/view",
+        {"object_id": "project-1", **view},
+    ) in requests
     assert (
         "POST",
         "/v1/project_logs/project-1/insert",
         {"events": events},
     ) in requests
+
+
+async def test_monitor_view_writes_inject_project_id(tmp_path) -> None:
+    requests = []
+    target = BtSyncTarget(tmp_path, settings())
+    project = await target.create_project("my project", None)
+
+    def fake_request(method, path, payload=None):
+        requests.append((method, path, payload))
+        if path.startswith("/v1/project?"):
+            return {"objects": []}
+        if path == "/v1/project":
+            return {"id": "project-1"}
+        if method == "GET":
+            return {"objects": []}
+        return {"id": "view-1", **(payload or {})}
+
+    target._request = fake_request
+    view = {
+        "name": "Prod overview",
+        "object_type": "project",
+        "view_type": "monitor",
+        "view_data": {"custom_charts": [{"id": "w-traces", "chartType": "timeseries"}]},
+        "options": {
+            "viewType": "monitor",
+            "options": {"type": "project", "spanType": "range", "rangeValue": "7d"},
+        },
+    }
+    await target.write_view(project, view, update=False)
+    posted = next(
+        payload for method, path, payload in requests if method == "POST" and path == "/v1/view"
+    )
+    assert posted["options"]["options"]["projectId"] == "project-1"
 
 
 async def test_each_partition_gets_independent_bt_sync_state(tmp_path, monkeypatch) -> None:

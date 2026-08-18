@@ -18,6 +18,7 @@ class Resource(StrEnum):
     ONLINE_EVALS = "online-evals"
     REVIEW_SCORES = "review-scores"
     ANNOTATION_QUEUES = "annotation-queues"
+    DASHBOARDS = "dashboards"
 
 
 DEFAULT_RESOURCES = frozenset(Resource)

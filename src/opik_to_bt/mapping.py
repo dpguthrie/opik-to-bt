@@ -536,6 +536,8 @@ _FILTER_FIELDS = {
     "thread_id": "metadata.thread_id",
     "model": "metadata.opik.model",
     "provider": "metadata.opik.provider",
+    "duration": "metrics.duration",
+    "total_estimated_cost": "metrics.estimated_cost",
 }
 _MUSTACHE = re.compile(r"\{\{\s*([^}]+?)\s*\}\}")
 THREAD_IDLE_SECONDS = 900.0
@@ -977,3 +979,368 @@ def review_flag_event(trace_id: str, queue: Any) -> dict[str, Any]:
             ["metadata", "opik_annotation_queue_id"],
         ],
     }
+
+
+ROOT_SPAN_FILTER = "is_root"
+THREAD_SPAN_FILTER = "metadata.thread_id IS NOT NULL"
+LLM_SPAN_FILTER = "span_attributes.type = 'llm'"
+ERROR_SPAN_FILTER = "error IS NOT NULL"
+_DURATION_PERCENTILES = {"p50": 0.5, "p90": 0.9, "p99": 0.99}
+_BREAKDOWN_FIELDS = {
+    "tags": "tags",
+    "name": "span_attributes.name",
+    "error_info": "error",
+    "error_type": "error",
+    "model": "metadata.opik.model",
+    "provider": "metadata.opik.provider",
+    "type": "span_attributes.type",
+    "guardrail_name": "span_attributes.name",
+}
+_USAGE_MEASURES = {
+    "total_tokens": "metrics.tokens",
+    "prompt_tokens": "metrics.prompt_tokens",
+    "completion_tokens": "metrics.completion_tokens",
+    "usage.total_tokens": "metrics.tokens",
+    "usage.prompt_tokens": "metrics.prompt_tokens",
+    "usage.completion_tokens": "metrics.completion_tokens",
+}
+
+
+def _cfg(config: dict[str, Any], snake: str, default: Any = None) -> Any:
+    parts = snake.split("_")
+    camel = parts[0] + "".join(part.title() for part in parts[1:])
+    if snake in config and config[snake] is not None:
+        return config[snake]
+    if camel in config and config[camel] is not None:
+        return config[camel]
+    return default
+
+
+def _and_sql(*parts: str | None) -> str | None:
+    clauses = [part for part in parts if part]
+    return " AND ".join(clauses) or None
+
+
+def _score_measure(name: str) -> str:
+    trimmed = name.strip()
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", trimmed):
+        return f"avg(scores.{trimmed})"
+    escaped = trimmed.replace("`", "``")
+    return f"avg(scores.`{escaped}`)"
+
+
+def _percentile_measures(values: Any) -> list[str]:
+    measures = []
+    for item in values or []:
+        token = str(item).strip().lower().removeprefix("duration.")
+        if token in {"avg", "average", "mean"}:
+            measures.append("avg(metrics.duration)")
+            continue
+        percentile = _DURATION_PERCENTILES.get(token)
+        if percentile is None:
+            continue
+        measures.append(f"percentile(metrics.duration, {percentile})")
+    return measures or [
+        "percentile(metrics.duration, 0.5)",
+        "percentile(metrics.duration, 0.9)",
+        "percentile(metrics.duration, 0.99)",
+    ]
+
+
+def _usage_measures(values: Any, *, aggregator: str = "sum") -> list[str]:
+    measures = []
+    for item in values or []:
+        field = _USAGE_MEASURES.get(str(item).strip().lower())
+        if field:
+            measures.append(f"{aggregator}({field})")
+    return measures or [f"{aggregator}(metrics.tokens)"]
+
+
+def _dashboard_config(dashboard: Any) -> dict[str, Any]:
+    raw = jsonable(as_dict(dashboard))
+    config = raw.get("config")
+    if isinstance(config, dict):
+        return config
+    return {}
+
+
+def dashboard_widgets(dashboard: Any) -> list[dict[str, Any]]:
+    config = _dashboard_config(dashboard)
+    widgets = []
+    for section in config.get("sections") or []:
+        widgets.extend(as_dict(section).get("widgets") or [])
+    if not widgets:
+        widgets.extend(config.get("widgets") or [])
+    return [jsonable(as_dict(widget)) for widget in widgets]
+
+
+def _widget_title(widget: dict[str, Any]) -> str:
+    title = (
+        widget.get("title") or widget.get("generatedTitle") or widget.get("generated_title") or ""
+    )
+    return str(title).strip() or "Untitled widget"
+
+
+def _widget_chart(
+    widget: dict[str, Any],
+    *,
+    chart_type: str,
+    measures: list[str],
+    visualization: str | None = None,
+    unit: str | None = None,
+    span_filter: str | None = None,
+    trace_filter: str | None = None,
+    group_by: str | None = None,
+) -> dict[str, Any]:
+    chart_id = str(widget.get("id") or _widget_title(widget))
+    return compact(
+        {
+            "id": chart_id,
+            "title": _widget_title(widget),
+            "chartType": chart_type,
+            "visualization": visualization,
+            "unit": unit,
+            "measures": measures,
+            "spanFilter": span_filter,
+            "traceFilter": trace_filter,
+            "groupBy": group_by,
+        }
+    )
+
+
+def _compile_widget_filters(
+    config: dict[str, Any], extra_span: str | None = None
+) -> tuple[str | None, str | None, str | None]:
+    span_sql, span_error = filters_to_sql(_cfg(config, "span_filters"))
+    if span_error:
+        return None, None, span_error
+    thread_sql, thread_error = filters_to_sql(_cfg(config, "thread_filters"))
+    if thread_error:
+        return None, None, thread_error
+    trace_sql, trace_error = filters_to_sql(_cfg(config, "trace_filters"))
+    if trace_error:
+        return None, None, trace_error
+    return _and_sql(span_sql, thread_sql, extra_span), trace_sql, None
+
+
+def _breakdown_group(config: dict[str, Any]) -> tuple[str | None, str | None]:
+    breakdown = _cfg(config, "breakdown")
+    if not isinstance(breakdown, dict):
+        return None, None
+    field = str(breakdown.get("field") or "").strip().lower()
+    if not field or field == "none":
+        return None, None
+    if field == "metadata":
+        key = str(breakdown.get("metadataKey") or breakdown.get("metadata_key") or "").strip()
+        if not key:
+            return None, "metadata breakdown has no key"
+        return f"metadata.{key}", None
+    mapped = _BREAKDOWN_FIELDS.get(field)
+    if mapped is None:
+        return None, f"breakdown field {field!r} is not translated"
+    return mapped, None
+
+
+def _translate_project_metrics(
+    widget: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str]:
+    config = as_dict(widget.get("config") or {})
+    metric = str(_cfg(config, "metric_type") or "TRACE_COUNT").strip().upper()
+    chart_kind = str(_cfg(config, "chart_type") or "line").strip().lower()
+    if chart_kind == "radar":
+        return None, "skipped — radar charts have no Monitor equivalent"
+    visualization = "bar" if chart_kind == "bar" else "line"
+    extra_span = None
+    unit = "count"
+    measures: list[str] = []
+    if metric == "TRACE_COUNT":
+        extra_span = ROOT_SPAN_FILTER
+        measures = ["count(id)"]
+    elif metric == "SPAN_COUNT":
+        measures = ["count(id)"]
+    elif metric == "THREAD_COUNT":
+        extra_span = THREAD_SPAN_FILTER
+        measures = ["count_distinct(metadata.thread_id)"]
+    elif metric in {"DURATION", "TRACE_DURATION", "SPAN_DURATION", "THREAD_DURATION"}:
+        extra_span = {
+            "DURATION": ROOT_SPAN_FILTER,
+            "TRACE_DURATION": ROOT_SPAN_FILTER,
+            "THREAD_DURATION": THREAD_SPAN_FILTER,
+        }.get(metric)
+        measures = _percentile_measures(_cfg(config, "duration_metrics"))
+        unit = "duration"
+    elif metric in {
+        "TRACE_AVERAGE_DURATION",
+        "SPAN_AVERAGE_DURATION",
+        "THREAD_AVERAGE_DURATION",
+    }:
+        extra_span = {
+            "TRACE_AVERAGE_DURATION": ROOT_SPAN_FILTER,
+            "THREAD_AVERAGE_DURATION": THREAD_SPAN_FILTER,
+        }.get(metric)
+        measures = ["avg(metrics.duration)"]
+        unit = "duration"
+    elif metric in {"TOKEN_USAGE", "SPAN_TOKEN_USAGE"}:
+        extra_span = ROOT_SPAN_FILTER if metric == "TOKEN_USAGE" else None
+        measures = _usage_measures(_cfg(config, "usage_metrics"))
+    elif metric == "COST":
+        extra_span = ROOT_SPAN_FILTER
+        measures = ["sum(metrics.estimated_cost)"]
+        unit = "cost"
+    elif metric in {"FEEDBACK_SCORES", "THREAD_FEEDBACK_SCORES", "SPAN_FEEDBACK_SCORES"}:
+        extra_span = {
+            "FEEDBACK_SCORES": ROOT_SPAN_FILTER,
+            "THREAD_FEEDBACK_SCORES": THREAD_SPAN_FILTER,
+        }.get(metric)
+        names = [
+            str(name).strip()
+            for name in (_cfg(config, "feedback_scores") or [])
+            if str(name).strip()
+        ]
+        if not names:
+            return None, "skipped — feedback-score widget has no score names"
+        measures = [_score_measure(name) for name in names]
+    elif metric in {"TRACE_ERROR_RATE", "SPAN_ERROR_RATE"}:
+        extra_span = ROOT_SPAN_FILTER if metric == "TRACE_ERROR_RATE" else None
+        measures = ["sum(metrics.errors) / count(id)"]
+        unit = "percent"
+    elif metric == "GUARDRAILS_FAILED_COUNT":
+        return None, "skipped — guardrail-failed count has no dedicated Monitor metric"
+    else:
+        return None, f"skipped — metric {metric!r} is not translated"
+    span_filter, trace_filter, error = _compile_widget_filters(config, extra_span)
+    if error:
+        return None, f"skipped — {error}"
+    group_by, group_error = _breakdown_group(config)
+    if group_error:
+        return None, f"skipped — {group_error}"
+    chart = _widget_chart(
+        widget,
+        chart_type="timeseries",
+        measures=measures,
+        visualization=visualization,
+        unit=unit,
+        span_filter=span_filter,
+        trace_filter=trace_filter,
+        group_by=group_by,
+    )
+    return chart, f"timeseries {' '.join(measures)}"
+
+
+def _translate_stats_card(widget: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+    config = as_dict(widget.get("config") or {})
+    metric = str(_cfg(config, "metric") or "trace_count").strip()
+    source = str(_cfg(config, "source") or "traces").strip().lower()
+    extra_span = ROOT_SPAN_FILTER if source != "spans" else None
+    unit = "count"
+    measures: list[str]
+    lowered = metric.lower()
+    if lowered in {"trace_count"}:
+        extra_span = ROOT_SPAN_FILTER
+        measures = ["count(id)"]
+    elif lowered == "thread_count":
+        extra_span = THREAD_SPAN_FILTER
+        measures = ["count_distinct(metadata.thread_id)"]
+    elif lowered == "span_count" and source == "spans":
+        extra_span = None
+        measures = ["count(id)"]
+    elif lowered == "llm_span_count":
+        extra_span = LLM_SPAN_FILTER
+        measures = ["count(id)"]
+    elif lowered in {"duration.p50", "duration.p90", "duration.p99"}:
+        measures = _percentile_measures([lowered])
+        unit = "duration"
+    elif lowered == "total_estimated_cost_sum":
+        measures = ["sum(metrics.estimated_cost)"]
+        unit = "cost"
+    elif lowered == "total_estimated_cost":
+        measures = ["avg(metrics.estimated_cost)"]
+        unit = "cost"
+    elif lowered in _USAGE_MEASURES:
+        measures = [f"avg({_USAGE_MEASURES[lowered]})"]
+    elif lowered == "error_count":
+        extra_span = _and_sql(extra_span, ERROR_SPAN_FILTER)
+        measures = ["count(id)"]
+    elif lowered.startswith("feedback_scores."):
+        name = metric.split(".", 1)[1].strip()
+        if not name:
+            return None, "skipped — feedback-score card has no score name"
+        measures = [_score_measure(name)]
+    elif lowered == "guardrails_failed_count":
+        return None, "skipped — guardrail-failed count has no dedicated Monitor metric"
+    elif lowered in {"input", "output", "metadata", "tags", "span_count"}:
+        return None, f"skipped — stat card metric {metric!r} is not a Monitor chart"
+    else:
+        return None, f"skipped — stat card metric {metric!r} is not translated"
+    span_filter, trace_filter, error = _compile_widget_filters(config, extra_span)
+    if error:
+        return None, f"skipped — {error}"
+    chart = _widget_chart(
+        widget,
+        chart_type="bignumber",
+        measures=measures,
+        unit=unit,
+        span_filter=span_filter,
+        trace_filter=trace_filter,
+    )
+    return chart, f"bignumber {' '.join(measures)}"
+
+
+def _translate_widget(widget: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+    kind = str(widget.get("type") or "").strip().lower()
+    title = _widget_title(widget)
+    if kind == "project_metrics":
+        chart, note = _translate_project_metrics(widget)
+    elif kind == "project_stats_card":
+        chart, note = _translate_stats_card(widget)
+    elif kind == "text_markdown":
+        chart, note = None, "skipped — markdown is not a Monitor chart"
+    elif kind in {"experiments_feedback_scores", "experiment_leaderboard"}:
+        chart, note = None, f"skipped — {kind.replace('_', ' ')} has no Monitor equivalent"
+    elif not kind:
+        chart, note = None, "skipped — widget has no type"
+    else:
+        chart, note = None, f"skipped — widget type {kind!r} is not translated"
+    return chart, f"{title}: {note}"
+
+
+def dashboard_view_payload(
+    dashboard: Any,
+) -> tuple[dict[str, Any] | None, str | None, list[str]]:
+    """Build a Braintrust Monitor view for an Opik production dashboard."""
+    raw = jsonable(as_dict(dashboard))
+    notes = []
+    charts = []
+    for widget in dashboard_widgets(dashboard):
+        chart, note = _translate_widget(widget)
+        notes.append(note)
+        if chart is not None:
+            charts.append(chart)
+    kind = str(raw.get("type") or "multi_project").strip().lower()
+    scope = str(raw.get("scope") or "workspace").strip().lower()
+    if scope == "insights":
+        return None, "built-in Insights dashboards are not migrated", notes
+    if kind == "experiments":
+        return (
+            None,
+            "experiment dashboards are inventoried, not written as Monitor views",
+            notes,
+        )
+    if kind and kind != "multi_project":
+        return None, f"dashboard type {kind!r} is not translated", notes
+    if not charts:
+        return None, "no translatable production widgets", notes
+    return (
+        {
+            "name": str(raw.get("name") or "Opik dashboard"),
+            "object_type": "project",
+            "view_type": "monitor",
+            "view_data": {"custom_charts": charts},
+            "options": {
+                "viewType": "monitor",
+                "options": {"type": "project", "spanType": "range", "rangeValue": "7d"},
+            },
+        },
+        None,
+        notes,
+    )

@@ -1,6 +1,7 @@
 import pytest
 
 from opik_to_bt.mapping import (
+    dashboard_view_payload,
     dataset_event,
     experiment_events,
     filters_to_sql,
@@ -527,3 +528,131 @@ def test_review_view_and_flag_events_use_queue_identity() -> None:
     assert event["metadata"]["~__bt_review_lists"]["__bt_default_review_list"]["status"] == (
         "PENDING"
     )
+
+
+def _dashboard(**overrides):
+    item = {
+        "id": "dash-1",
+        "name": "Prod overview",
+        "type": "multi_project",
+        "scope": "workspace",
+        "config": {
+            "sections": [
+                {
+                    "id": "sec-1",
+                    "title": "Traffic",
+                    "widgets": [
+                        {
+                            "id": "w-traces",
+                            "type": "project_metrics",
+                            "title": "Trace volume",
+                            "config": {
+                                "metricType": "TRACE_COUNT",
+                                "chartType": "line",
+                                "traceFilters": [
+                                    {
+                                        "field": "tags",
+                                        "operator": "contains",
+                                        "value": "prod",
+                                    }
+                                ],
+                                "breakdown": {"field": "model"},
+                            },
+                        },
+                        {
+                            "id": "w-latency",
+                            "type": "project_stats_card",
+                            "title": "P90 latency",
+                            "config": {"source": "traces", "metric": "duration.p90"},
+                        },
+                        {
+                            "id": "w-notes",
+                            "type": "text_markdown",
+                            "title": "Notes",
+                            "config": {"content": "Runbook"},
+                        },
+                    ],
+                }
+            ]
+        },
+    }
+    item.update(overrides)
+    return item
+
+
+def test_production_dashboard_becomes_monitor_charts() -> None:
+    payload, skip, notes = dashboard_view_payload(_dashboard())
+    assert skip is None
+    assert payload["view_type"] == "monitor"
+    charts = payload["view_data"]["custom_charts"]
+    assert [chart["chartType"] for chart in charts] == ["timeseries", "bignumber"]
+    traces, latency = charts
+    assert traces["measures"] == ["count(id)"]
+    assert traces["spanFilter"] == "is_root"
+    assert traces["traceFilter"] == "tags IN ('prod')"
+    assert traces["groupBy"] == "metadata.opik.model"
+    assert latency["measures"] == ["percentile(metrics.duration, 0.9)"]
+    assert latency["unit"] == "duration"
+    assert any("markdown is not a Monitor chart" in note for note in notes)
+
+
+def test_experiment_radar_and_insights_dashboards_are_skipped() -> None:
+    _, skip, notes = dashboard_view_payload(
+        _dashboard(
+            type="experiments",
+            config={
+                "sections": [
+                    {
+                        "widgets": [
+                            {
+                                "id": "w-radar",
+                                "type": "project_metrics",
+                                "title": "Scores",
+                                "config": {
+                                    "metricType": "FEEDBACK_SCORES",
+                                    "chartType": "radar",
+                                    "feedbackScores": ["Hallucination"],
+                                },
+                            }
+                        ]
+                    }
+                ]
+            },
+        )
+    )
+    assert "experiment dashboards" in skip
+    assert any("radar" in note for note in notes)
+
+    _, skip, _ = dashboard_view_payload(_dashboard(scope="insights"))
+    assert "Insights" in skip
+
+    payload, skip, notes = dashboard_view_payload(
+        _dashboard(
+            config={
+                "sections": [
+                    {
+                        "widgets": [
+                            {
+                                "id": "w-cost",
+                                "type": "project_metrics",
+                                "title": "Cost",
+                                "config": {"metric_type": "COST"},
+                            },
+                            {
+                                "id": "w-scores",
+                                "type": "project_metrics",
+                                "title": "Hallucination",
+                                "config": {
+                                    "metricType": "FEEDBACK_SCORES",
+                                    "feedbackScores": ["Hallucination"],
+                                },
+                            },
+                        ]
+                    }
+                ]
+            }
+        )
+    )
+    assert skip is None
+    measures = [chart["measures"] for chart in payload["view_data"]["custom_charts"]]
+    assert measures == [["sum(metrics.estimated_cost)"], ["avg(scores.Hallucination)"]]
