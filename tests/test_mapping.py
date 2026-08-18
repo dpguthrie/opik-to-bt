@@ -7,6 +7,10 @@ from opik_to_bt.mapping import (
     online_score_payload,
     prompt_definition,
     prompt_slug,
+    queue_reviewer_notes,
+    review_flag_event,
+    review_score_payload,
+    review_view_payload,
     rewrite_judge_template,
     scorer_definitions,
     span_event,
@@ -455,3 +459,71 @@ def test_online_score_skips_disabled_python_and_experiment_rules() -> None:
     assert "experiment-only" in skip
     _, skip = online_score_payload(_judge_evaluator(), [])
     assert skip == "no translated scorers to attach"
+
+
+def test_numerical_and_boolean_feedback_definitions_become_review_scores() -> None:
+    slider, skip = review_score_payload(
+        {
+            "id": "def-1",
+            "name": "Quality",
+            "type": "numerical",
+            "description": "SME quality",
+            "details": {"min": 0, "max": 1},
+        }
+    )
+    assert skip is None
+    assert slider["score_type"] == "slider"
+    assert slider["description"] == "SME quality"
+
+    boolean, skip = review_score_payload(
+        {
+            "id": "def-2",
+            "name": "Grounded",
+            "type": "boolean",
+            "details": {"trueLabel": "yes", "falseLabel": "no"},
+        }
+    )
+    assert skip is None
+    assert boolean["score_type"] == "categorical"
+    assert boolean["categories"] == [
+        {"name": "yes", "value": 1.0},
+        {"name": "no", "value": 0.0},
+    ]
+
+
+def test_categorical_values_outside_unit_interval_are_rescaled() -> None:
+    payload, skip = review_score_payload(
+        {
+            "id": "def-3",
+            "name": "Severity",
+            "type": "categorical",
+            "details": {"categories": {"low": 1, "medium": 2, "high": 3}},
+        }
+    )
+    assert skip is None
+    values = {item["name"]: item["value"] for item in payload["categories"]}
+    assert values == {"low": 0.0, "medium": 0.5, "high": 1.0}
+    assert "rescaled" in payload["description"]
+
+
+def test_review_view_and_flag_events_use_queue_identity() -> None:
+    queue = {
+        "id": "queue-1",
+        "name": "Hallucination backlog",
+        "scope": "thread",
+        "instructions": "Mark grounded answers.",
+        "annotators_per_item": 2,
+        "feedback_definition_names": ["Grounded"],
+    }
+    view = review_view_payload(queue)
+    assert view["view_type"] == "for_review_project_log"
+    assert view["options"]["grouping"] == "metadata.thread_id"
+    assert "queue-1" in view["view_data"]["search"]["filter"][0]
+    assert "annotators_per_item=2" in queue_reviewer_notes(queue)
+
+    event = review_flag_event("trace-9", queue)
+    assert event["id"] == "opik:trace:trace-9"
+    assert event["_is_merge"] is True
+    assert event["metadata"]["~__bt_review_lists"]["__bt_default_review_list"]["status"] == (
+        "PENDING"
+    )

@@ -832,3 +832,148 @@ def online_score_payload(
             },
         }
     ), None
+
+
+REVIEW_FLAG_LIST = "__bt_default_review_list"
+
+
+def _feedback_details(raw: dict[str, Any]) -> dict[str, Any]:
+    return as_dict(raw.get("details") or raw.get("details_") or {})
+
+
+def _rescale_category_values(categories: dict[str, float]) -> dict[str, float]:
+    values = list(categories.values())
+    if not values:
+        return categories
+    low, high = min(values), max(values)
+    if low >= 0 and high <= 1:
+        return categories
+    if high == low:
+        return {name: 1.0 for name in categories}
+    return {name: (value - low) / (high - low) for name, value in categories.items()}
+
+
+def review_score_payload(definition: Any) -> tuple[dict[str, Any] | None, str | None]:
+    """Map an Opik feedback definition onto a Braintrust human-review project score."""
+    raw = jsonable(as_dict(definition))
+    name = str(raw.get("name") or "").strip()
+    if not name:
+        return None, "feedback definition has no name"
+    kind = str(raw.get("type") or "").lower()
+    details = jsonable(_feedback_details(raw))
+    description_parts = [text for text in [raw.get("description")] if text]
+    if kind == "numerical":
+        low = _number(details.get("min"))
+        high = _number(details.get("max"))
+        if low is None or high is None:
+            return None, "numerical definition is missing min/max"
+        if high < low:
+            return None, "numerical definition has max below min"
+        if low != 0 or high != 1:
+            description_parts.append(
+                f"Opik range was {low:g}-{high:g}. Braintrust review sliders are 0-1; "
+                "historical values outside [0, 1] were stored as metrics."
+            )
+        return {
+            "name": name,
+            "description": " ".join(description_parts) or None,
+            "score_type": "slider",
+        }, None
+    if kind == "categorical":
+        raw_categories = details.get("categories") or {}
+        if not isinstance(raw_categories, dict) or not raw_categories:
+            return None, "categorical definition has no categories"
+        numeric = {
+            str(label): value
+            for label, raw_value in raw_categories.items()
+            if (value := _number(raw_value)) is not None
+        }
+        if not numeric:
+            return None, "categorical definition has no numeric values"
+        scaled = _rescale_category_values(numeric)
+        if scaled != numeric:
+            description_parts.append(
+                "Opik category values were rescaled into Braintrust's 0-1 range."
+            )
+        return {
+            "name": name,
+            "description": " ".join(description_parts) or None,
+            "score_type": "categorical",
+            "categories": [{"name": label, "value": value} for label, value in scaled.items()],
+        }, None
+    if kind == "boolean":
+        true_label = (
+            str(details.get("true_label") or details.get("trueLabel") or "true").strip() or "true"
+        )
+        false_label = (
+            str(details.get("false_label") or details.get("falseLabel") or "false").strip()
+            or "false"
+        )
+        return {
+            "name": name,
+            "description": " ".join(description_parts) or None,
+            "score_type": "categorical",
+            "categories": [
+                {"name": true_label, "value": 1.0},
+                {"name": false_label, "value": 0.0},
+            ],
+        }, None
+    return None, f"feedback definition type {kind or 'missing'!r} is not translated"
+
+
+def queue_reviewer_notes(queue: Any) -> str:
+    raw = jsonable(as_dict(queue))
+    notes = []
+    if instructions := str(raw.get("instructions") or "").strip():
+        notes.append(instructions)
+    extras = []
+    if raw.get("scope"):
+        extras.append(f"Opik scope: {raw['scope']}")
+    if raw.get("comments_enabled") is not None:
+        extras.append(f"comments_enabled={raw['comments_enabled']}")
+    if raw.get("annotators_per_item") is not None:
+        extras.append(f"annotators_per_item={raw['annotators_per_item']} (not enforced)")
+    if raw.get("lock_timeout_seconds") is not None:
+        extras.append(f"lock_timeout_seconds={raw['lock_timeout_seconds']} (not enforced)")
+    if extras:
+        notes.append("Unmapped Opik queue fields: " + "; ".join(extras) + ".")
+    return "\n\n".join(notes)
+
+
+def review_view_payload(queue: Any) -> dict[str, Any]:
+    """Build a Braintrust Review view for an Opik annotation queue."""
+    raw = jsonable(as_dict(queue))
+    queue_id = str(raw.get("id") or raw.get("name") or "queue")
+    options: dict[str, Any] = {"layout": "kanban"}
+    if str(raw.get("scope") or "").lower() == "thread":
+        options["grouping"] = "metadata.thread_id"
+    return {
+        "name": str(raw.get("name") or "Opik annotation queue"),
+        "object_type": "project",
+        "view_type": "for_review_project_log",
+        "view_data": {
+            "search": {
+                "filter": [f"metadata.opik_annotation_queue_id = '{queue_id}'"],
+            }
+        },
+        "options": options,
+    }
+
+
+def review_flag_event(trace_id: str, queue: Any) -> dict[str, Any]:
+    """Merge a pending-review flag onto an already migrated Braintrust root span."""
+    raw = jsonable(as_dict(queue))
+    return {
+        "id": source_id("trace", trace_id),
+        "metadata": {
+            "~__bt_review_lists": {REVIEW_FLAG_LIST: {"status": "PENDING"}},
+            "opik_annotation_queue": raw.get("name"),
+            "opik_annotation_queue_id": raw.get("id"),
+        },
+        "_is_merge": True,
+        "_merge_paths": [
+            ["metadata", "~__bt_review_lists"],
+            ["metadata", "opik_annotation_queue"],
+            ["metadata", "opik_annotation_queue_id"],
+        ],
+    }

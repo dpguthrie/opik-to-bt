@@ -1,9 +1,9 @@
 # Opik → Braintrust migrator
 
 A resumable Python 3.13 CLI for moving Opik prompts, datasets, experiments,
-traces/spans, scorers, and online evaluation rules into Braintrust. It supports
-Opik Cloud or self-hosted Opik and Braintrust US, EU, or self-hosted
-deployments.
+traces/spans, scorers, online evaluation rules, human-review scores, and
+annotation queues into Braintrust. It supports Opik Cloud or self-hosted Opik
+and Braintrust US, EU, or self-hosted deployments.
 
 ## What it migrates
 
@@ -16,18 +16,28 @@ deployments.
 | Prompts | Prompts | `--prompts`, `--prompt-history` |
 | Online eval scorers | Scorer functions | `--resources scorers`, `--scorers` |
 | Online eval rules | Online scoring automations | `--resources online-evals`, `--online-evals` |
+| Feedback definitions | Human-review score widgets | `--resources review-scores`, `--review-scores` |
+| Annotation queues | Review views + flagged logs | `--resources annotation-queues`, `--annotation-queues` |
 
 `--start` is inclusive and `--end` is exclusive. Dates apply to experiment
 creation time and root trace start time; all child spans of a selected trace are
-preserved. Datasets, prompts, scorers, and online evals are not inherently
-time-bounded.
+preserved. Datasets, prompts, scorers, online evals, review scores, and
+annotation queues are not inherently time-bounded.
 
-`--resources all` includes scorers and online scoring rules. Migrating
-`online-evals` creates Braintrust automations that score **new production
-traffic**. Historical scores already on traces are copied with logs; the new
-rules do not rewind those rows. Omit `online-evals` (for example
-`--resources datasets,experiments,logs,prompts,scorers`) if you want the
+`--resources all` includes scorers, online scoring rules, human-review scores,
+and annotation queues.
+
+Migrating `online-evals` creates Braintrust automations that score **new
+production traffic**. Historical scores already on traces are copied with logs;
+the new rules do not rewind those rows. Omit `online-evals` if you want the
 scorer definitions without attaching live scoring.
+
+Migrating `annotation-queues` creates Braintrust Review views and flags the
+**current queue backlog** as unassigned Awaiting review. It does not assign
+reviewers or lock items. Human scores already on traces are copied with logs;
+`review-scores` adds the widgets SMEs use to keep labeling. Omit
+`annotation-queues` (for example `--resources datasets,experiments,logs,prompts,scorers,review-scores`)
+if you want the score widgets without flagging a backlog.
 
 ## How it scales
 
@@ -46,13 +56,13 @@ logs, and prompt jobs run concurrently, while bounded queues prevent memory or
 disk usage from growing with the total migration size. Dataset migrations
 complete before dependent experiments.
 
-Project-scoped prompts, scorers, and online scoring rules use the Braintrust
-REST API because `bt sync` operates on data rows, not those definitions. The
-default `latest` mode retrieves each Opik prompt's explicit `latest_version`
-and creates one Braintrust version. The opt-in `all` mode paginates every Opik
-version and writes them oldest-to-newest so the Braintrust prompt ends on the
-same latest content. Each source version ID maps to its returned Braintrust
-`_xact_id` in the checkpoint.
+Project-scoped prompts, scorers, online scoring rules, human-review scores, and
+annotation-queue views use the Braintrust REST API because `bt sync` operates
+on data rows, not those definitions. The default `latest` mode retrieves each
+Opik prompt's explicit `latest_version` and creates one Braintrust version. The
+opt-in `all` mode paginates every Opik version and writes them oldest-to-newest
+so the Braintrust prompt ends on the same latest content. Each source version
+ID maps to its returned Braintrust `_xact_id` in the checkpoint.
 
 Opik traces and spans are separate resources. The migrator paginates each
 project-wide endpoint in bulk: each trace page becomes a bounded chunk, then one
@@ -100,7 +110,8 @@ Dataset records, experiment events, and logs go through
 parallel, byte-bounded uploads, retries, and resumable upload state. Prompt
 definitions use Braintrust's versioned prompt REST endpoints. Scorer functions
 and online scoring rules use Braintrust's function and project-score REST
-endpoints.
+endpoints. Human-review scores use project-score widgets; annotation queues
+become Review views and merge pending-review flags onto already migrated logs.
 
 ## Quick start
 
@@ -113,11 +124,11 @@ cp .env.example .env
 ```
 
 Set `OPIK_API_KEY` and `OPIK_WORKSPACE` in `.env`, then authenticate `bt` against
-the destination or set `BRAINTRUST_API_KEY`. Prompt, scorer, online-eval, and
-object-level dataset/experiment tag writes specifically require
-`BRAINTRUST_API_KEY`; a `bt` login profile alone cannot authenticate those
-direct REST requests. Change `OPIK_URL` and `BRAINTRUST_URL` for self-hosted
-deployments.
+the destination or set `BRAINTRUST_API_KEY`. Prompt, scorer, online-eval,
+review-score, annotation-queue, and object-level dataset/experiment tag writes
+specifically require `BRAINTRUST_API_KEY`; a `bt` login profile alone cannot
+authenticate those direct REST requests. Change `OPIK_URL` and `BRAINTRUST_URL`
+for self-hosted deployments.
 
 Preview the selected scope:
 
@@ -138,13 +149,14 @@ uv run opik-to-bt \
   --end 2026-02-01
 ```
 
-Resources default to `all` (datasets, experiments, logs, prompts, scorers, and
-online evals). Optional semantic filters remain available:
+Resources default to `all` (datasets, experiments, logs, prompts, scorers,
+online evals, review scores, and annotation queues). Optional semantic filters
+remain available:
 
 ```bash
 uv run opik-to-bt \
   --projects support-bot \
-  --resources datasets,experiments,logs,prompts,scorers,online-evals \
+  --resources datasets,experiments,logs,prompts,scorers,online-evals,review-scores,annotation-queues \
   --datasets golden-set,edge-cases \
   --experiments baseline,v2 \
   --prompts support-answer,route-request \
@@ -154,12 +166,13 @@ uv run opik-to-bt \
 
 Because `all` includes online scoring, new production logs in Braintrust will be
 scored after those rules are created. Omit `online-evals` to copy scorer
-definitions without attaching live scoring:
+definitions without attaching live scoring. Omit `annotation-queues` to copy
+human-review score widgets without flagging the current backlog:
 
 ```bash
 uv run opik-to-bt \
   --projects support-bot \
-  --resources datasets,experiments,logs,prompts,scorers
+  --resources datasets,experiments,logs,prompts,scorers,review-scores
 ```
 
 Prompt history is intentionally opt-in:
@@ -191,7 +204,7 @@ destination prompt first.
 | `OPIK_API_KEY` | — | Opik API key |
 | `OPIK_WORKSPACE` | — | Opik workspace |
 | `BRAINTRUST_URL` | `https://api.braintrust.dev` | Braintrust US/EU/self-hosted API |
-| `BRAINTRUST_API_KEY` | profile or environment | Braintrust authentication; prompts, scorers, online evals, and object-level tags require an API key |
+| `BRAINTRUST_API_KEY` | profile or environment | Braintrust authentication; prompts, scorers, online evals, review scores, annotation queues, and object-level tags require an API key |
 | `OPIK_TO_BT_PROMPT_HISTORY` | `latest` | Prompt version scope: `latest` or `all` |
 
 Operational overrides exist through `OPIK_TO_BT_*` environment variables for
@@ -298,6 +311,24 @@ must remain on its root volume.
   prints a warning whenever `online-evals` is selected, including via `all`.
 - Migrated traces copy Opik `thread_id` onto `metadata.thread_id` so grouped
   online scoring can find the same conversations after logs have been moved.
+- Opik feedback definitions become Braintrust human-review project scores.
+  Numerical `[0, 1]` ranges become sliders. Other numerical ranges still become
+  sliders, with the original min/max recorded in the description; historical
+  values outside `[0, 1]` remain metrics from log migration. Categorical maps
+  become categorical widgets (values outside `[0, 1]` are rescaled). Booleans
+  become two-category widgets using the Opik true/false labels. Workspace-level
+  definitions are replicated into each selected Braintrust project. A definition
+  that collides with an existing online score name is skipped.
+- Opik annotation queues become Braintrust Review views (`for_review_project_log`)
+  named after the queue. Current queue members are flagged with
+  `~__bt_review_lists.__bt_default_review_list=PENDING` so they appear in
+  Awaiting review. Reviewers are not auto-assigned. `annotators_per_item` and
+  lock timeout have no Braintrust equivalent and are reported in the dry-run /
+  log line. Thread queues group the Review table by `metadata.thread_id` and
+  flag each trace in the thread. Selecting `annotation-queues` also writes the
+  human-review score widgets those queues need. Flagging runs after logs for
+  that project so the destination rows exist. The CLI prints a warning whenever
+  `annotation-queues` is selected, including via `all`.
 
 Dataset version history is not included. A future opt-in mode could map Opik
 item history to Braintrust dataset snapshots.
@@ -314,12 +345,14 @@ environment first, then `.env`, then the defaults shown below.
 | Flag | Default | Controls |
 |---|---:|---|
 | `--projects NAME[,NAME...]` | All projects | Limits the migration to exact Opik project names. |
-| `--resources all\|datasets,experiments,logs,prompts,scorers,online-evals` | `all` | Selects resource types. `all` is every supported resource, including scorers and online scoring rules. Migrating `online-evals` starts scoring new production logs in Braintrust. |
+| `--resources all\|datasets,experiments,logs,prompts,scorers,online-evals,review-scores,annotation-queues` | `all` | Selects resource types. `all` is every supported resource. Migrating `online-evals` starts scoring new production logs. Migrating `annotation-queues` flags the current review backlog. |
 | `--datasets NAME[,NAME...]` | All datasets | Limits datasets by exact name within the selected projects. This does not select experiments that reference an excluded dataset. |
 | `--experiments NAME[,NAME...]` | All experiments | Limits experiments by exact name within the selected projects. |
 | `--prompts NAME[,NAME...]` | All prompts | Limits prompts by exact name within the selected projects. |
 | `--scorers NAME[,NAME...]` | All scorers | Limits migrated scorer functions by the source online-eval rule name. |
 | `--online-evals NAME[,NAME...]` | All online evals | Limits online scoring automations by the source rule name. Selecting `online-evals` also writes any scorers those rules need. |
+| `--review-scores NAME[,NAME...]` | All review scores | Limits migrated human-review score widgets by the source feedback-definition name. |
+| `--annotation-queues NAME[,NAME...]` | All annotation queues | Limits Review views and backlog flagging by the source queue name. Selecting `annotation-queues` also writes the review-score widgets those queues need. |
 | `--prompt-history latest\|all` | `OPIK_TO_BT_PROMPT_HISTORY`, then `latest` | Migrates only each prompt's explicit latest version or replays every version oldest-to-newest. The CLI flag overrides the environment setting. |
 | `--start ISO-8601` | No lower bound | Inclusive UTC lower bound for experiment creation time and root-trace start time. A timezone-free value is interpreted as UTC. It does not filter datasets. |
 | `--end ISO-8601` | Run-start snapshot | Exclusive UTC upper bound for experiments and logs. When omitted, the run start is checkpointed and reused on resume so new Opik data cannot move the boundary. |
@@ -338,7 +371,7 @@ utility flags and do not affect migration behavior.
 | `OPIK_API_KEY` | Unset | Opik API key. |
 | `OPIK_WORKSPACE` | Unset | Opik workspace used by the SDK. |
 | `BRAINTRUST_URL` | `https://api.braintrust.dev` | Braintrust API base URL passed to `bt sync`. Set this for the EU endpoint or a self-hosted deployment. |
-| `BRAINTRUST_API_KEY` | Unset | Braintrust API key inherited by `bt sync` and used for direct REST operations. When unset, `bt` can use its existing authenticated profile for row uploads, but prompts, scorers, online evals, and object-level tags cannot be migrated. |
+| `BRAINTRUST_API_KEY` | Unset | Braintrust API key inherited by `bt sync` and used for direct REST operations. When unset, `bt` can use its existing authenticated profile for row uploads, but prompts, scorers, online evals, review scores, annotation queues, and object-level tags cannot be migrated. |
 
 ### Reliability and performance variables
 

@@ -155,6 +155,45 @@ async def test_function_and_project_score_writes_use_rest_api(tmp_path) -> None:
     assert ("PUT", "/v1/project_score", {"project_id": "project-1", **score}) in requests
 
 
+async def test_view_and_review_flag_writes_use_rest_api(tmp_path) -> None:
+    requests = []
+    target = BtSyncTarget(tmp_path, settings())
+    project = await target.create_project("my project", None)
+
+    def fake_request(method, path, payload=None):
+        requests.append((method, path, payload))
+        if path.startswith("/v1/project?"):
+            return {"objects": []}
+        if path == "/v1/project":
+            return {"id": "project-1"}
+        if method == "GET":
+            return {"objects": []}
+        return {"id": "view-1", **(payload or {})}
+
+    target._request = fake_request
+    view = {
+        "name": "Hallucination backlog",
+        "object_type": "project",
+        "view_type": "for_review_project_log",
+        "view_data": {"search": {"filter": ["metadata.opik_annotation_queue_id = 'queue-1'"]}},
+        "options": {"layout": "kanban"},
+    }
+    events = [{"id": "opik:trace:trace-9", "_is_merge": True}]
+
+    assert await target.get_view(project, view["name"], view_type=view["view_type"]) is None
+    await target.write_view(project, view, update=False)
+    await target.write_view(project, view, update=True)
+    await target.flag_logs_for_review(project, events)
+
+    assert ("POST", "/v1/view", {"object_id": "project-1", **view}) in requests
+    assert ("PUT", "/v1/view", {"object_id": "project-1", **view}) in requests
+    assert (
+        "POST",
+        "/v1/project_logs/project-1/insert",
+        {"events": events},
+    ) in requests
+
+
 async def test_each_partition_gets_independent_bt_sync_state(tmp_path, monkeypatch) -> None:
     commands = []
 

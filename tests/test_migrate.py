@@ -468,6 +468,28 @@ class ScorerTarget:
         self.score_writes.append((update, definition))
         return written
 
+    async def get_view(self, project_id, name, *, view_type):
+        del project_id, view_type
+        return self.views.get(name) if hasattr(self, "views") else None
+
+    async def write_view(self, project_id, definition, *, update):
+        del project_id
+        if not hasattr(self, "views"):
+            self.views = {}
+            self.view_writes = []
+            self.next_view = 1
+        written = {"id": f"view-{self.next_view}", **definition}
+        self.next_view += 1
+        self.views[definition["name"]] = written
+        self.view_writes.append((update, definition))
+        return written
+
+    async def flag_logs_for_review(self, project_id, events):
+        del project_id
+        if not hasattr(self, "flagged"):
+            self.flagged = []
+        self.flagged.extend(events)
+
 
 def _judge(name="Hallucination", **overrides):
     rule = {
@@ -602,3 +624,112 @@ async def test_python_metrics_skip_and_disabled_rules_keep_scorers(tmp_path) -> 
     assert checkpoint.completed("scorer:rule-2")
     assert checkpoint.completed("online-eval:py-1")
     assert checkpoint.completed("online-eval:rule-2")
+
+
+class ReviewSource:
+    def __init__(self, definitions, queues, traces=None, threads=None) -> None:
+        self._definitions = definitions
+        self._queues = queues
+        self._traces = traces or []
+        self._threads = threads or []
+
+    async def projects(self):
+        return [{"id": "project-1", "name": "selected"}]
+
+    async def feedback_definitions(self):
+        return self._definitions
+
+    async def annotation_queues(self, project_id):
+        del project_id
+        return self._queues
+
+    async def annotation_queue_traces(self, project_id, queue_id):
+        del project_id, queue_id
+        return self._traces
+
+    async def annotation_queue_threads(self, project_id, queue_id):
+        del project_id, queue_id
+        return self._threads
+
+    async def traces_for_thread(self, project_id, thread_id):
+        del project_id
+        return [
+            trace for trace in self._traces if as_dict_trace(trace).get("thread_id") == thread_id
+        ]
+
+
+def as_dict_trace(trace):
+    return trace if isinstance(trace, dict) else {}
+
+
+def _definition(**overrides):
+    item = {
+        "id": "def-1",
+        "name": "Grounded",
+        "type": "boolean",
+        "details": {"true_label": "yes", "false_label": "no"},
+    }
+    item.update(overrides)
+    return item
+
+
+def _queue(**overrides):
+    item = {
+        "id": "queue-1",
+        "name": "Hallucination backlog",
+        "project_id": "project-1",
+        "scope": "trace",
+        "instructions": "Mark grounded answers.",
+        "feedback_definition_names": ["Grounded"],
+        "items_count": 1,
+    }
+    item.update(overrides)
+    return item
+
+
+async def test_review_scores_write_human_review_widgets(tmp_path) -> None:
+    source = ReviewSource([_definition()], [])
+    target = ScorerTarget()
+    checkpoint = Checkpoint(tmp_path / "checkpoint.json")
+
+    await Migrator(source, target, checkpoint).run(scorer_selection(Resource.REVIEW_SCORES))
+    await Migrator(source, target, checkpoint).run(scorer_selection(Resource.REVIEW_SCORES))
+
+    assert len(target.score_writes) == 1
+    _, payload = target.score_writes[0]
+    assert payload["score_type"] == "categorical"
+    assert checkpoint.completed("review-score:project-1:def-1")
+
+
+async def test_annotation_queues_write_review_scores_then_flag_items(tmp_path) -> None:
+    source = ReviewSource(
+        [_definition()],
+        [_queue()],
+        traces=[{"id": "trace-9", "thread_id": None}],
+    )
+    target = ScorerTarget()
+    checkpoint = Checkpoint(tmp_path / "checkpoint.json")
+
+    await Migrator(source, target, checkpoint).run(scorer_selection(Resource.ANNOTATION_QUEUES))
+
+    assert target.score_writes[0][1]["name"] == "Grounded"
+    assert target.view_writes[0][1]["view_type"] == "for_review_project_log"
+    assert [event["id"] for event in target.flagged] == ["opik:trace:trace-9"]
+    assert checkpoint.completed("annotation-queue:queue-1")
+
+
+async def test_thread_queues_flag_traces_in_the_thread(tmp_path) -> None:
+    source = ReviewSource(
+        [_definition()],
+        [_queue(scope="thread")],
+        traces=[{"id": "trace-a", "thread_id": "thread-1"}],
+        threads=[{"id": "thread-1"}],
+    )
+    target = ScorerTarget()
+
+    await Migrator(source, target, Checkpoint(tmp_path / "checkpoint.json")).run(
+        scorer_selection(Resource.ANNOTATION_QUEUES)
+    )
+
+    assert [event["id"] for event in target.flagged] == ["opik:trace:trace-a"]
+    assert target.view_writes[0][1]["options"]["grouping"] == "metadata.thread_id"

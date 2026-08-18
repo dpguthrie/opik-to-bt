@@ -26,7 +26,7 @@ def main(
         str,
         typer.Option(
             help="all, or a comma-separated subset of datasets, experiments, logs, "
-            "prompts, scorers, and online-evals."
+            "prompts, scorers, online-evals, review-scores, and annotation-queues."
         ),
     ] = "all",
     datasets: Annotated[
@@ -46,6 +46,20 @@ def main(
         typer.Option(
             "--online-evals",
             help="Optional comma-separated online evaluation rule names.",
+        ),
+    ] = None,
+    review_scores: Annotated[
+        str | None,
+        typer.Option(
+            "--review-scores",
+            help="Optional comma-separated human-review score / feedback-definition names.",
+        ),
+    ] = None,
+    annotation_queues: Annotated[
+        str | None,
+        typer.Option(
+            "--annotation-queues",
+            help="Optional comma-separated annotation queue names.",
         ),
     ] = None,
     prompt_history: Annotated[
@@ -86,6 +100,8 @@ def main(
             prompt_history=prompt_history or settings.prompt_history,
             scorers=parse_csv(scorers),
             online_evals=parse_csv(online_evals),
+            review_scores=parse_csv(review_scores),
+            annotation_queues=parse_csv(annotation_queues),
             start=start_at,
             end=end_at,
             dry_run=dry_run,

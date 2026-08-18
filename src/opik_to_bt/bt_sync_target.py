@@ -147,6 +147,50 @@ class BtSyncTarget:
             {"project_id": project_id, **definition},
         )
 
+    async def get_view(
+        self, project_handle: str, name: str, *, view_type: str
+    ) -> dict[str, Any] | None:
+        project_id = await self._prompt_project_id(project_handle)
+        query = urllib.parse.urlencode(
+            {
+                "object_type": "project",
+                "object_id": project_id,
+                "view_type": view_type,
+                "view_name": name,
+            }
+        )
+        found = await asyncio.to_thread(self._request, "GET", f"/v1/view?{query}")
+        objects = found.get("objects") or []
+        return objects[0] if objects else None
+
+    async def write_view(
+        self,
+        project_handle: str,
+        definition: dict[str, Any],
+        *,
+        update: bool,
+    ) -> dict[str, Any]:
+        project_id = await self._prompt_project_id(project_handle)
+        return await asyncio.to_thread(
+            self._request,
+            "PUT" if update else "POST",
+            "/v1/view",
+            {"object_id": project_id, **definition},
+        )
+
+    async def flag_logs_for_review(self, project_handle: str, events: list[dict[str, Any]]) -> None:
+        if not events:
+            return
+        project_id = await self._prompt_project_id(project_handle)
+        for offset in range(0, len(events), 100):
+            batch = events[offset : offset + 100]
+            await asyncio.to_thread(
+                self._request,
+                "POST",
+                f"/v1/project_logs/{project_id}/insert",
+                {"events": batch},
+            )
+
     async def create_dataset(self, project_id: str, name: str, description: str | None) -> str:
         del description
         _, project, _ = self._decode(project_id)
@@ -211,8 +255,9 @@ class BtSyncTarget:
         api_key = self.api_key or os.environ.get("BRAINTRUST_API_KEY")
         if not api_key:
             raise RuntimeError(
-                "Prompt, scorer, and online-eval migration need BRAINTRUST_API_KEY; "
-                "`bt` login profiles do not cover direct Braintrust REST calls."
+                "Prompt, scorer, online-eval, review-score, and annotation-queue "
+                "migration need BRAINTRUST_API_KEY; `bt` login profiles do not cover "
+                "direct Braintrust REST calls."
             )
         request = urllib.request.Request(
             f"{self.api_url}{path}",
