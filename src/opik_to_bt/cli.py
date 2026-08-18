@@ -25,8 +25,8 @@ def main(
     resources: Annotated[
         str,
         typer.Option(
-            help="all (datasets, experiments, logs, prompts), or a comma-separated "
-            "list including opt-in scorers and online-evals."
+            help="all, or a comma-separated subset of datasets, experiments, logs, "
+            "prompts, scorers, and online-evals."
         ),
     ] = "all",
     datasets: Annotated[

@@ -121,6 +121,12 @@ class Migrator:
             if missing:
                 raise RuntimeError(f"Opik projects not found: {', '.join(sorted(missing))}")
         self.progress.message(f"Selected {len(projects)} project(s)")
+        if Resource.ONLINE_EVALS in selection.resources:
+            self.progress.message(
+                "Warning: online scoring will score new production logs in Braintrust. "
+                "Already migrated traces are not re-scored. Omit online-evals to copy "
+                "scorer definitions without attaching live scoring."
+            )
         if selection.dry_run:
             await self._inventory(projects, selection)
             return
@@ -762,7 +768,7 @@ class Migrator:
                 bits.append(f"online {online_status}")
             details.append(f"    {raw['name']} ({kind}/{scope}): {', '.join(bits)}")
         if Resource.SCORERS in selection.resources:
-            extra.append(f"{scorer_count} scorer(s) [opt-in]")
+            extra.append(f"{scorer_count} scorer(s)")
         if Resource.ONLINE_EVALS in selection.resources:
-            extra.append(f"{online_count} online eval(s) [opt-in]")
+            extra.append(f"{online_count} online eval(s)")
         return extra, details

@@ -1,8 +1,9 @@
 # Opik → Braintrust migrator
 
 A resumable Python 3.13 CLI for moving Opik prompts, datasets, experiments,
-and traces/spans into Braintrust. It supports Opik Cloud or self-hosted Opik
-and Braintrust US, EU, or self-hosted deployments.
+traces/spans, scorers, and online evaluation rules into Braintrust. It supports
+Opik Cloud or self-hosted Opik and Braintrust US, EU, or self-hosted
+deployments.
 
 ## What it migrates
 
@@ -19,8 +20,14 @@ and Braintrust US, EU, or self-hosted deployments.
 `--start` is inclusive and `--end` is exclusive. Dates apply to experiment
 creation time and root trace start time; all child spans of a selected trace are
 preserved. Datasets, prompts, scorers, and online evals are not inherently
-time-bounded. `scorers` and `online-evals` are opt-in and are not included when
-`--resources` is `all`.
+time-bounded.
+
+`--resources all` includes scorers and online scoring rules. Migrating
+`online-evals` creates Braintrust automations that score **new production
+traffic**. Historical scores already on traces are copied with logs; the new
+rules do not rewind those rows. Omit `online-evals` (for example
+`--resources datasets,experiments,logs,prompts,scorers`) if you want the
+scorer definitions without attaching live scoring.
 
 ## How it scales
 
@@ -131,13 +138,13 @@ uv run opik-to-bt \
   --end 2026-02-01
 ```
 
-Resources default to `all` (datasets, experiments, logs, and prompts). Optional
-semantic filters remain available. Online eval scorers and rules are opt-in:
+Resources default to `all` (datasets, experiments, logs, prompts, scorers, and
+online evals). Optional semantic filters remain available:
 
 ```bash
 uv run opik-to-bt \
   --projects support-bot \
-  --resources datasets,experiments,logs,prompts \
+  --resources datasets,experiments,logs,prompts,scorers,online-evals \
   --datasets golden-set,edge-cases \
   --experiments baseline,v2 \
   --prompts support-answer,route-request \
@@ -145,10 +152,14 @@ uv run opik-to-bt \
   --end 2026-02-01
 ```
 
+Because `all` includes online scoring, new production logs in Braintrust will be
+scored after those rules are created. Omit `online-evals` to copy scorer
+definitions without attaching live scoring:
+
 ```bash
 uv run opik-to-bt \
   --projects support-bot \
-  --resources scorers,online-evals
+  --resources datasets,experiments,logs,prompts,scorers
 ```
 
 Prompt history is intentionally opt-in:
@@ -282,7 +293,9 @@ must remain on its root volume.
   binding and leave the scorer in place. Custom Python metrics, multimodal
   judge messages, disabled rules, and experiment-only triggers are inventoried
   and skipped rather than silently dropped. A dry-run prints translate/skip
-  per rule. Creating an online rule does not re-score already migrated logs.
+  per rule. Creating an online rule does not re-score already migrated logs,
+  but it does start scoring **new production traffic** in Braintrust. The CLI
+  prints a warning whenever `online-evals` is selected, including via `all`.
 - Migrated traces copy Opik `thread_id` onto `metadata.thread_id` so grouped
   online scoring can find the same conversations after logs have been moved.
 
@@ -301,7 +314,7 @@ environment first, then `.env`, then the defaults shown below.
 | Flag | Default | Controls |
 |---|---:|---|
 | `--projects NAME[,NAME...]` | All projects | Limits the migration to exact Opik project names. |
-| `--resources all\|datasets,experiments,logs,prompts,scorers,online-evals` | `all` | Selects resource types. `all` is datasets, experiments, logs, and prompts. `scorers` and `online-evals` are opt-in and must be named. Combine them with `all,scorers,online-evals`. |
+| `--resources all\|datasets,experiments,logs,prompts,scorers,online-evals` | `all` | Selects resource types. `all` is every supported resource, including scorers and online scoring rules. Migrating `online-evals` starts scoring new production logs in Braintrust. |
 | `--datasets NAME[,NAME...]` | All datasets | Limits datasets by exact name within the selected projects. This does not select experiments that reference an excluded dataset. |
 | `--experiments NAME[,NAME...]` | All experiments | Limits experiments by exact name within the selected projects. |
 | `--prompts NAME[,NAME...]` | All prompts | Limits prompts by exact name within the selected projects. |

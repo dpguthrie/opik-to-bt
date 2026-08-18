@@ -569,8 +569,9 @@ async def test_dry_run_inventories_opt_in_scorers_and_online_evals(tmp_path) -> 
         )
     )
     joined = "\n".join(progress.lines)
-    assert "2 scorer(s) [opt-in]" in joined
-    assert "2 online eval(s) [opt-in]" in joined
+    assert "2 scorer(s)" in joined
+    assert "2 online eval(s)" in joined
+    assert "Warning: online scoring will score new production logs" in joined
     assert "Hallucination (llm_as_judge/trace): scorer translate, online translate" in joined
     assert "Length (user_defined_metric_python/trace): scorer skipped" in joined
 
