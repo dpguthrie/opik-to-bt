@@ -24,7 +24,10 @@ def main(
     ] = None,
     resources: Annotated[
         str,
-        typer.Option(help="all, or a comma-separated list: datasets,experiments,logs,prompts."),
+        typer.Option(
+            help="all (datasets, experiments, logs, prompts), or a comma-separated "
+            "list including opt-in scorers and online-evals."
+        ),
     ] = "all",
     datasets: Annotated[
         str | None, typer.Option(help="Optional comma-separated dataset names.")
@@ -34,6 +37,16 @@ def main(
     ] = None,
     prompts: Annotated[
         str | None, typer.Option(help="Optional comma-separated prompt names.")
+    ] = None,
+    scorers: Annotated[
+        str | None, typer.Option(help="Optional comma-separated online-eval / scorer names.")
+    ] = None,
+    online_evals: Annotated[
+        str | None,
+        typer.Option(
+            "--online-evals",
+            help="Optional comma-separated online evaluation rule names.",
+        ),
     ] = None,
     prompt_history: Annotated[
         PromptHistory | None,
@@ -71,6 +84,8 @@ def main(
             experiments=parse_csv(experiments),
             prompts=parse_csv(prompts),
             prompt_history=prompt_history or settings.prompt_history,
+            scorers=parse_csv(scorers),
+            online_evals=parse_csv(online_evals),
             start=start_at,
             end=end_at,
             dry_run=dry_run,

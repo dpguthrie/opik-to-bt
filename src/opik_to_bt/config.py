@@ -14,6 +14,14 @@ class Resource(StrEnum):
     EXPERIMENTS = "experiments"
     LOGS = "logs"
     PROMPTS = "prompts"
+    SCORERS = "scorers"
+    ONLINE_EVALS = "online-evals"
+
+
+DEFAULT_RESOURCES = frozenset(
+    {Resource.DATASETS, Resource.EXPERIMENTS, Resource.LOGS, Resource.PROMPTS}
+)
+OPT_IN_RESOURCES = frozenset({Resource.SCORERS, Resource.ONLINE_EVALS})
 
 
 class PromptHistory(StrEnum):
@@ -42,15 +50,19 @@ def parse_csv(value: str | None) -> set[str] | None:
 
 def parse_resources(value: str) -> set[Resource]:
     names = parse_csv(value) or {"all"}
+    selected: set[Resource] = set()
     if "all" in names:
-        return set(Resource)
+        selected = set(DEFAULT_RESOURCES)
+        names = names - {"all"}
     try:
-        return {Resource(name) for name in names}
+        selected |= {Resource(name) for name in names}
     except ValueError as exc:
         allowed = ", ".join(resource.value for resource in Resource)
         raise ValueError(
-            f"Resources must be 'all' or a comma-separated subset of: {allowed}"
+            f"Resources must be 'all' or a comma-separated subset of: {allowed}. "
+            "scorers and online-evals are opt-in and are not included in 'all'."
         ) from exc
+    return selected
 
 
 class Settings(BaseSettings):

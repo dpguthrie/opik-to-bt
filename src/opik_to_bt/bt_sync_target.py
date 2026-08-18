@@ -103,6 +103,50 @@ class BtSyncTarget:
             {"project_id": project_id, **definition},
         )
 
+    async def get_function(self, project_handle: str, slug: str) -> dict[str, Any] | None:
+        project_id = await self._prompt_project_id(project_handle)
+        query = urllib.parse.urlencode({"project_id": project_id, "slug": slug})
+        found = await asyncio.to_thread(self._request, "GET", f"/v1/function?{query}")
+        objects = found.get("objects") or []
+        return objects[0] if objects else None
+
+    async def write_function(
+        self,
+        project_handle: str,
+        definition: dict[str, Any],
+        *,
+        update: bool,
+    ) -> dict[str, Any]:
+        project_id = await self._prompt_project_id(project_handle)
+        return await asyncio.to_thread(
+            self._request,
+            "PUT" if update else "POST",
+            "/v1/function",
+            {"project_id": project_id, **definition},
+        )
+
+    async def get_project_score(self, project_handle: str, name: str) -> dict[str, Any] | None:
+        project_id = await self._prompt_project_id(project_handle)
+        query = urllib.parse.urlencode({"project_id": project_id, "project_score_name": name})
+        found = await asyncio.to_thread(self._request, "GET", f"/v1/project_score?{query}")
+        objects = found.get("objects") or []
+        return objects[0] if objects else None
+
+    async def write_project_score(
+        self,
+        project_handle: str,
+        definition: dict[str, Any],
+        *,
+        update: bool,
+    ) -> dict[str, Any]:
+        project_id = await self._prompt_project_id(project_handle)
+        return await asyncio.to_thread(
+            self._request,
+            "PUT" if update else "POST",
+            "/v1/project_score",
+            {"project_id": project_id, **definition},
+        )
+
     async def create_dataset(self, project_id: str, name: str, description: str | None) -> str:
         del description
         _, project, _ = self._decode(project_id)
@@ -167,7 +211,7 @@ class BtSyncTarget:
         api_key = self.api_key or os.environ.get("BRAINTRUST_API_KEY")
         if not api_key:
             raise RuntimeError(
-                "Prompt migration and object-level tags need BRAINTRUST_API_KEY; "
+                "Prompt, scorer, and online-eval migration need BRAINTRUST_API_KEY; "
                 "`bt` login profiles do not cover direct Braintrust REST calls."
             )
         request = urllib.request.Request(

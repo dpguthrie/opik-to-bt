@@ -13,10 +13,14 @@ and Braintrust US, EU, or self-hosted deployments.
 | Experiments and results | Experiments and events | `--experiments`, `--start`, `--end` |
 | Traces and spans | Project logs | `--start`, `--end` |
 | Prompts | Prompts | `--prompts`, `--prompt-history` |
+| Online eval scorers | Scorer functions | `--resources scorers`, `--scorers` |
+| Online eval rules | Online scoring automations | `--resources online-evals`, `--online-evals` |
 
 `--start` is inclusive and `--end` is exclusive. Dates apply to experiment
 creation time and root trace start time; all child spans of a selected trace are
-preserved. Datasets and prompts are not inherently time-bounded.
+preserved. Datasets, prompts, scorers, and online evals are not inherently
+time-bounded. `scorers` and `online-evals` are opt-in and are not included when
+`--resources` is `all`.
 
 ## How it scales
 
@@ -35,12 +39,13 @@ logs, and prompt jobs run concurrently, while bounded queues prevent memory or
 disk usage from growing with the total migration size. Dataset migrations
 complete before dependent experiments.
 
-Project-scoped prompts use the Braintrust REST API because `bt sync` operates on
-data rows, not prompt definitions. The default `latest` mode retrieves each
-Opik prompt's explicit `latest_version` and creates one Braintrust version. The
-opt-in `all` mode paginates every Opik version and writes them oldest-to-newest
-so the Braintrust prompt ends on the same latest content. Each source version
-ID maps to its returned Braintrust `_xact_id` in the checkpoint.
+Project-scoped prompts, scorers, and online scoring rules use the Braintrust
+REST API because `bt sync` operates on data rows, not those definitions. The
+default `latest` mode retrieves each Opik prompt's explicit `latest_version`
+and creates one Braintrust version. The opt-in `all` mode paginates every Opik
+version and writes them oldest-to-newest so the Braintrust prompt ends on the
+same latest content. Each source version ID maps to its returned Braintrust
+`_xact_id` in the checkpoint.
 
 Opik traces and spans are separate resources. The migrator paginates each
 project-wide endpoint in bulk: each trace page becomes a bounded chunk, then one
@@ -86,7 +91,9 @@ middle of an Opik page.
 Dataset records, experiment events, and logs go through
 [`bt sync`](https://www.braintrust.dev/docs/reference/cli/sync), which provides
 parallel, byte-bounded uploads, retries, and resumable upload state. Prompt
-definitions use Braintrust's versioned prompt REST endpoints.
+definitions use Braintrust's versioned prompt REST endpoints. Scorer functions
+and online scoring rules use Braintrust's function and project-score REST
+endpoints.
 
 ## Quick start
 
@@ -99,10 +106,11 @@ cp .env.example .env
 ```
 
 Set `OPIK_API_KEY` and `OPIK_WORKSPACE` in `.env`, then authenticate `bt` against
-the destination or set `BRAINTRUST_API_KEY`. Prompt migration and object-level
-dataset/experiment tags specifically require `BRAINTRUST_API_KEY`; a `bt` login
-profile alone cannot authenticate those direct REST requests. Change `OPIK_URL`
-and `BRAINTRUST_URL` for self-hosted deployments.
+the destination or set `BRAINTRUST_API_KEY`. Prompt, scorer, online-eval, and
+object-level dataset/experiment tag writes specifically require
+`BRAINTRUST_API_KEY`; a `bt` login profile alone cannot authenticate those
+direct REST requests. Change `OPIK_URL` and `BRAINTRUST_URL` for self-hosted
+deployments.
 
 Preview the selected scope:
 
@@ -123,7 +131,8 @@ uv run opik-to-bt \
   --end 2026-02-01
 ```
 
-Resources default to `all`. Optional semantic filters remain available:
+Resources default to `all` (datasets, experiments, logs, and prompts). Optional
+semantic filters remain available. Online eval scorers and rules are opt-in:
 
 ```bash
 uv run opik-to-bt \
@@ -134,6 +143,12 @@ uv run opik-to-bt \
   --prompts support-answer,route-request \
   --start 2026-01-01 \
   --end 2026-02-01
+```
+
+```bash
+uv run opik-to-bt \
+  --projects support-bot \
+  --resources scorers,online-evals
 ```
 
 Prompt history is intentionally opt-in:
@@ -165,7 +180,7 @@ destination prompt first.
 | `OPIK_API_KEY` | — | Opik API key |
 | `OPIK_WORKSPACE` | — | Opik workspace |
 | `BRAINTRUST_URL` | `https://api.braintrust.dev` | Braintrust US/EU/self-hosted API |
-| `BRAINTRUST_API_KEY` | profile or environment | Braintrust authentication; prompts and object-level tags require an API key |
+| `BRAINTRUST_API_KEY` | profile or environment | Braintrust authentication; prompts, scorers, online evals, and object-level tags require an API key |
 | `OPIK_TO_BT_PROMPT_HISTORY` | `latest` | Prompt version scope: `latest` or `all` |
 
 Operational overrides exist through `OPIK_TO_BT_*` environment variables for
@@ -259,6 +274,17 @@ must remain on its root volume.
   checkpoint. Opik environment assignments are not currently migrated.
 - `prompt_data.origin` is deliberately not used for Opik provenance because
   Braintrust reserves it for references to other saved Braintrust prompts.
+- Opik online evaluation rules split into two Braintrust objects: an LLM-as-judge
+  scorer function and an online `project_score` that binds it to production
+  logs. Span, trace, and thread rules become span, trace, and group scope.
+  Thread grouping uses `metadata.thread_id`. Sampling and structured filters
+  are translated; filters that cannot be compiled to SQL skip the online
+  binding and leave the scorer in place. Custom Python metrics, multimodal
+  judge messages, disabled rules, and experiment-only triggers are inventoried
+  and skipped rather than silently dropped. A dry-run prints translate/skip
+  per rule. Creating an online rule does not re-score already migrated logs.
+- Migrated traces copy Opik `thread_id` onto `metadata.thread_id` so grouped
+  online scoring can find the same conversations after logs have been moved.
 
 Dataset version history is not included. A future opt-in mode could map Opik
 item history to Braintrust dataset snapshots.
@@ -275,10 +301,12 @@ environment first, then `.env`, then the defaults shown below.
 | Flag | Default | Controls |
 |---|---:|---|
 | `--projects NAME[,NAME...]` | All projects | Limits the migration to exact Opik project names. |
-| `--resources all\|datasets,experiments,logs,prompts` | `all` | Selects resource types. Any comma-separated subset of `datasets`, `experiments`, `logs`, and `prompts` is valid. |
+| `--resources all\|datasets,experiments,logs,prompts,scorers,online-evals` | `all` | Selects resource types. `all` is datasets, experiments, logs, and prompts. `scorers` and `online-evals` are opt-in and must be named. Combine them with `all,scorers,online-evals`. |
 | `--datasets NAME[,NAME...]` | All datasets | Limits datasets by exact name within the selected projects. This does not select experiments that reference an excluded dataset. |
 | `--experiments NAME[,NAME...]` | All experiments | Limits experiments by exact name within the selected projects. |
 | `--prompts NAME[,NAME...]` | All prompts | Limits prompts by exact name within the selected projects. |
+| `--scorers NAME[,NAME...]` | All scorers | Limits migrated scorer functions by the source online-eval rule name. |
+| `--online-evals NAME[,NAME...]` | All online evals | Limits online scoring automations by the source rule name. Selecting `online-evals` also writes any scorers those rules need. |
 | `--prompt-history latest\|all` | `OPIK_TO_BT_PROMPT_HISTORY`, then `latest` | Migrates only each prompt's explicit latest version or replays every version oldest-to-newest. The CLI flag overrides the environment setting. |
 | `--start ISO-8601` | No lower bound | Inclusive UTC lower bound for experiment creation time and root-trace start time. A timezone-free value is interpreted as UTC. It does not filter datasets. |
 | `--end ISO-8601` | Run-start snapshot | Exclusive UTC upper bound for experiments and logs. When omitted, the run start is checkpointed and reused on resume so new Opik data cannot move the boundary. |
@@ -297,7 +325,7 @@ utility flags and do not affect migration behavior.
 | `OPIK_API_KEY` | Unset | Opik API key. |
 | `OPIK_WORKSPACE` | Unset | Opik workspace used by the SDK. |
 | `BRAINTRUST_URL` | `https://api.braintrust.dev` | Braintrust API base URL passed to `bt sync`. Set this for the EU endpoint or a self-hosted deployment. |
-| `BRAINTRUST_API_KEY` | Unset | Braintrust API key inherited by `bt sync` and used for direct REST operations. When unset, `bt` can use its existing authenticated profile for row uploads, but prompts and object-level tags cannot be migrated. |
+| `BRAINTRUST_API_KEY` | Unset | Braintrust API key inherited by `bt sync` and used for direct REST operations. When unset, `bt` can use its existing authenticated profile for row uploads, but prompts, scorers, online evals, and object-level tags cannot be migrated. |
 
 ### Reliability and performance variables
 

@@ -22,12 +22,20 @@ def tag_list(value: Any) -> list[str] | None:
     return list(tags) or None
 
 
-def prompt_slug(name: str, source_prompt_id: str) -> str:
+def object_slug(name: str, source_id: str, *, fallback: str = "opik-item") -> str:
     """Build a readable, deterministic Braintrust slug without name collisions."""
     normalized = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode()
-    stem = re.sub(r"[^a-z0-9]+", "-", normalized.lower()).strip("-") or "opik-prompt"
-    suffix = hashlib.sha256(source_prompt_id.encode()).hexdigest()[:8]
+    stem = re.sub(r"[^a-z0-9]+", "-", normalized.lower()).strip("-") or fallback
+    suffix = hashlib.sha256(source_id.encode()).hexdigest()[:8]
     return f"{stem[:80].rstrip('-')}-{suffix}"
+
+
+def prompt_slug(name: str, source_prompt_id: str) -> str:
+    return object_slug(name, source_prompt_id, fallback="opik-prompt")
+
+
+def scorer_slug(name: str, source_id: str) -> str:
+    return object_slug(name, source_id, fallback="opik-scorer")
 
 
 def prompt_definition(prompt: Any, version: Any) -> dict[str, Any]:
@@ -406,8 +414,15 @@ def trace_event(
             "tags": tag_list(raw_trace.get("tags")),
             "metadata": {
                 **(raw_trace.get("metadata") or {}),
+                **(
+                    {"thread_id": raw_trace["thread_id"]}
+                    if raw_trace.get("thread_id")
+                    and "thread_id" not in (raw_trace.get("metadata") or {})
+                    else {}
+                ),
                 "opik": {
                     "trace_id": raw_trace["id"],
+                    "thread_id": raw_trace.get("thread_id"),
                     "project_name": raw_trace.get("project_name"),
                     "feedback_scores": raw_trace.get("feedback_scores"),
                     "aggregate_usage": raw_trace.get("usage"),
@@ -483,3 +498,337 @@ def trace_events(trace: Any, spans: list[Any]) -> list[dict[str, Any]]:
         trace_event(trace, include_aggregate_metrics=not spans, spans=spans),
         *[span_event(raw_trace["id"], span) for span in spans],
     ]
+
+
+LLM_JUDGE_SCOPES = {
+    "llm_as_judge": "trace",
+    "span_llm_as_judge": "span",
+    "trace_thread_llm_as_judge": "group",
+}
+PYTHON_METRIC_TYPES = {
+    "user_defined_metric_python",
+    "span_user_defined_metric_python",
+    "trace_thread_user_defined_metric_python",
+}
+_VARIABLE_ROOTS = {
+    "input": "input",
+    "output": "output",
+    "expected": "expected",
+    "expected_output": "expected",
+    "context": "thread",
+    "metadata": "metadata",
+}
+_MESSAGE_ROLES = {
+    "system": "system",
+    "user": "user",
+    "ai": "assistant",
+    "assistant": "assistant",
+    "custom": "user",
+}
+_FILTER_FIELDS = {
+    "name": "span_attributes.name",
+    "type": "span_attributes.type",
+    "input": "input",
+    "output": "output",
+    "error": "error",
+    "error_info": "error",
+    "tags": "tags",
+    "thread_id": "metadata.thread_id",
+    "model": "metadata.opik.model",
+    "provider": "metadata.opik.provider",
+}
+_MUSTACHE = re.compile(r"\{\{\s*([^}]+?)\s*\}\}")
+THREAD_IDLE_SECONDS = 900.0
+NUMERIC_CHOICES = tuple(round(index / 10, 1) for index in range(11))
+
+
+def evaluator_type(evaluator: Any) -> str:
+    raw = as_dict(evaluator)
+    return str(raw.get("type") or "").lower()
+
+
+def evaluator_scope(evaluator: Any) -> str | None:
+    kind = evaluator_type(evaluator)
+    if kind in LLM_JUDGE_SCOPES:
+        return LLM_JUDGE_SCOPES[kind]
+    if kind == "span_user_defined_metric_python":
+        return "span"
+    if kind == "trace_thread_user_defined_metric_python":
+        return "group"
+    if kind == "user_defined_metric_python":
+        return "trace"
+    return None
+
+
+def _sql_literal(value: Any) -> str:
+    text = str(value).strip()
+    if re.fullmatch(r"-?\d+(?:\.\d+)?", text):
+        return text
+    return "'" + text.replace("'", "''") + "'"
+
+
+def _sql_field(filter_item: dict[str, Any]) -> str | None:
+    field = str(filter_item.get("field") or "").strip()
+    key = str(filter_item.get("key") or "").strip()
+    if field in {"metadata", "metadata_field"}:
+        return f"metadata.{key}" if key else "metadata"
+    if field in {"feedback_scores", "feedback_score", "scores"}:
+        return f"scores.{key}" if key else None
+    mapped = _FILTER_FIELDS.get(field)
+    if mapped:
+        return mapped
+    if field.startswith(("metadata.", "span_attributes.", "scores.", "metrics.")):
+        return field
+    return None
+
+
+def filters_to_sql(filters: Any) -> tuple[str | None, str | None]:
+    """Compile Opik structured filters to a Braintrust online-scoring SQL clause."""
+    clauses = []
+    for item in filters or []:
+        raw = as_dict(item)
+        field = _sql_field(raw)
+        operator = str(raw.get("operator") or "=").strip()
+        value = raw.get("value")
+        if field is None:
+            return None, f"filter field {raw.get('field')!r} is not translated"
+        if operator in {"is_empty", "is_not_empty"}:
+            clauses.append(f"{field} IS NULL" if operator == "is_empty" else f"{field} IS NOT NULL")
+            continue
+        if value is None:
+            return None, f"filter {field} {operator} has no value"
+        if operator == "=":
+            clauses.append(f"{field} = {_sql_literal(value)}")
+        elif operator == "!=":
+            clauses.append(f"{field} IS NOT {_sql_literal(value)}")
+        elif operator in {">", ">=", "<", "<="}:
+            clauses.append(f"{field} {operator} {_sql_literal(value)}")
+        elif operator == "contains" and field == "tags":
+            clauses.append(f"tags IN ({_sql_literal(value)})")
+        elif operator == "contains":
+            clauses.append(f"{field} MATCH {_sql_literal(value)}")
+        elif operator == "starts_with":
+            clauses.append(f"{field} LIKE {_sql_literal(f'{value}%')}")
+        elif operator == "ends_with":
+            clauses.append(f"{field} LIKE {_sql_literal(f'%{value}')}")
+        elif operator == "in":
+            values = [part.strip() for part in str(value).split(",") if part.strip()]
+            if not values:
+                return None, f"filter {field} in has no values"
+            joined = ", ".join(_sql_literal(part) for part in values)
+            clauses.append(f"{field} IN ({joined})")
+        else:
+            return None, f"filter operator {operator!r} is not translated"
+    return " AND ".join(clauses) or None, None
+
+
+def _rewrite_variable_path(path: str) -> str | None:
+    parts = [part.strip() for part in path.strip().split(".") if part.strip()]
+    if not parts:
+        return None
+    root = _VARIABLE_ROOTS.get(parts[0])
+    if root is None:
+        return None
+    return ".".join([root, *parts[1:]])
+
+
+def rewrite_judge_template(text: str, variables: dict[str, str] | None) -> str:
+    aliases = {str(name): str(path) for name, path in (variables or {}).items()}
+
+    def replace(match: re.Match[str]) -> str:
+        original = match.group(1).strip()
+        path = aliases.get(original, original)
+        rewritten = _rewrite_variable_path(path)
+        if rewritten is None:
+            return match.group(0)
+        return "{{" + rewritten + "}}"
+
+    return _MUSTACHE.sub(replace, text)
+
+
+def _message_text(message: dict[str, Any]) -> str | None:
+    content = message.get("content")
+    if isinstance(content, str) and content.strip():
+        return content
+    for part in message.get("content_array") or []:
+        part = as_dict(part)
+        if part.get("image_url") or part.get("video_url") or part.get("audio_url"):
+            return None
+        text = part.get("text")
+        if isinstance(text, str) and text.strip():
+            return text
+    return None
+
+
+def _judge_messages(code: dict[str, Any]) -> tuple[list[dict[str, str]] | None, str | None]:
+    messages = []
+    variables = {
+        str(name): str(path) for name, path in as_dict(code.get("variables") or {}).items() if path
+    }
+    for item in code.get("messages") or []:
+        raw = as_dict(item)
+        if raw.get("image_url") or raw.get("video_url") or raw.get("audio_url"):
+            return None, "multimodal judge messages are not translated"
+        for part in raw.get("content_array") or []:
+            if as_dict(part).get("image_url") or as_dict(part).get("video_url"):
+                return None, "multimodal judge messages are not translated"
+        text = _message_text(raw)
+        if text is None:
+            continue
+        role = _MESSAGE_ROLES.get(str(raw.get("role") or "user").lower())
+        if role is None:
+            return None, f"judge message role {raw.get('role')!r} is not translated"
+        messages.append({"role": role, "content": rewrite_judge_template(text, variables)})
+    if not messages:
+        return None, "LLM-as-judge rule has no text messages"
+    return messages, None
+
+
+def _choice_scores(schema: dict[str, Any]) -> tuple[dict[str, float], str] | tuple[None, str]:
+    kind = str(schema.get("type") or "").upper()
+    name = str(schema.get("name") or "score")
+    description = str(schema.get("description") or "").strip()
+    if kind == "BOOLEAN":
+        instruction = f"For {name}, answer with true or false."
+        if description:
+            instruction = f"{description.rstrip('.')}. {instruction}"
+        return {"true": 1.0, "false": 0.0}, instruction
+    if kind in {"DOUBLE", "INTEGER"}:
+        instruction = (
+            f"For {name}, return only one of: "
+            + ", ".join(str(choice) for choice in NUMERIC_CHOICES)
+            + "."
+        )
+        if description:
+            instruction = f"{description.rstrip('.')}. {instruction}"
+        return {str(choice): float(choice) for choice in NUMERIC_CHOICES}, instruction
+    return None, f"score schema type {kind or 'missing'!r} is not translated"
+
+
+def _model_options(model: Any) -> dict[str, Any]:
+    raw = as_dict(model) if model and not isinstance(model, str) else {"name": model}
+    options: dict[str, Any] = {}
+    if name := raw.get("name") or raw.get("model"):
+        options["model"] = str(name)
+    params = compact(
+        {
+            "temperature": _number(raw.get("temperature")),
+            "seed": raw.get("seed"),
+        }
+    )
+    if params:
+        options["params"] = params
+    return options
+
+
+def sampling_rate(evaluator: Any) -> float:
+    raw = as_dict(evaluator)
+    rate = _number(raw.get("sampling_rate"))
+    if rate is None:
+        return 1.0
+    if rate > 1:
+        rate = rate / 100
+    return min(1.0, max(0.0, rate))
+
+
+def scorer_definitions(evaluator: Any) -> tuple[list[dict[str, Any]], str | None]:
+    """Map an Opik evaluator into Braintrust LLM-as-judge scorer functions."""
+    raw = jsonable(as_dict(evaluator))
+    kind = evaluator_type(raw)
+    if kind in PYTHON_METRIC_TYPES:
+        return [], "custom Python metrics are not auto-translated"
+    if kind not in LLM_JUDGE_SCOPES:
+        return [], f"evaluator type {kind or 'missing'!r} is not translated"
+    code = as_dict(raw.get("code"))
+    messages, message_error = _judge_messages(code)
+    if message_error:
+        return [], message_error
+    schema_fields = [as_dict(item) for item in code.get("schema") or code.get("schema_") or []]
+    if not schema_fields:
+        schema_fields = [{"name": "score", "type": "BOOLEAN", "description": ""}]
+    definitions = []
+    rule_name = str(raw.get("name") or "Opik scorer")
+    source_id_value = str(raw.get("id") or rule_name)
+    for field in schema_fields:
+        scores, instruction = _choice_scores(field)
+        if scores is None:
+            return [], instruction
+        field_name = str(field.get("name") or "score")
+        name = rule_name if len(schema_fields) == 1 else f"{rule_name} · {field_name}"
+        field_id = source_id_value if len(schema_fields) == 1 else f"{source_id_value}:{field_name}"
+        prompt_messages = list(messages or [])
+        prompt_messages.append({"role": "user", "content": instruction})
+        prompt_data = {
+            "prompt": {"type": "chat", "messages": prompt_messages},
+            "template_format": "mustache",
+            "parser": {
+                "type": "llm_classifier",
+                "use_cot": True,
+                "choice_scores": scores,
+            },
+        }
+        if options := _model_options(code.get("model")):
+            prompt_data["options"] = options
+        definitions.append(
+            {
+                "name": name,
+                "slug": scorer_slug(name, field_id),
+                "description": raw.get("description"),
+                "function_type": "scorer",
+                "function_data": {"type": "prompt"},
+                "prompt_data": prompt_data,
+                "tags": ["opik"],
+            }
+        )
+    return definitions, None
+
+
+def online_score_payload(
+    evaluator: Any,
+    function_ids: list[str],
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Build a Braintrust online project_score that binds already-migrated scorers."""
+    raw = jsonable(as_dict(evaluator))
+    if not function_ids:
+        return None, "no translated scorers to attach"
+    if raw.get("enabled") is False:
+        return None, "rule is disabled"
+    trigger = str(raw.get("trigger_scope") or "production").lower()
+    if trigger == "experiment":
+        return None, "online scoring is not attached for experiment-only rules"
+    scope_type = evaluator_scope(raw)
+    if scope_type is None:
+        return None, f"evaluator type {evaluator_type(raw)!r} is not translated"
+    sql, sql_error = filters_to_sql(raw.get("filters"))
+    if sql_error:
+        return None, sql_error
+    if scope_type == "span":
+        scope: dict[str, Any] = {"type": "span"}
+    elif scope_type == "group":
+        scope = {
+            "type": "group",
+            "group_by": "metadata.thread_id",
+            "placement": "each",
+            "idle_seconds": THREAD_IDLE_SECONDS,
+        }
+    else:
+        scope = {"type": "trace", "idle_seconds": 30}
+    return compact(
+        {
+            "name": str(raw.get("name") or "Opik online eval"),
+            "description": raw.get("description"),
+            "score_type": "online",
+            "config": {
+                "online": compact(
+                    {
+                        "sampling_rate": sampling_rate(raw),
+                        "scorers": [
+                            {"type": "function", "id": function_id} for function_id in function_ids
+                        ],
+                        "btql_filter": sql,
+                        "scope": scope,
+                    }
+                )
+            },
+        }
+    ), None

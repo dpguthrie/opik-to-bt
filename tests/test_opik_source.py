@@ -149,3 +149,39 @@ async def test_prompt_versions_are_returned_oldest_first() -> None:
 
     versions = await source.prompt_versions("prompt-1")
     assert [version["id"] for version in versions] == ["v1", "v2", "v3"]
+
+
+async def test_evaluators_page_through_automation_rule_client() -> None:
+    source = object.__new__(OpikSource)
+    source.page_size = 2
+    source.request_options = {}
+    captured = {}
+
+    class Evaluators:
+        @staticmethod
+        def find_evaluators(*, project_id, page, size, request_options):
+            captured.update(
+                {
+                    "project_id": project_id,
+                    "page": page,
+                    "size": size,
+                    "request_options": request_options,
+                }
+            )
+            return {"content": [{"id": "rule-1"}], "total": 1}
+
+    class RestClient:
+        automation_rule_evaluators = Evaluators()
+
+    class Client:
+        rest_client = RestClient()
+
+    source.client = Client()
+
+    async def call(function, /, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    source._call = call
+    evaluators = await source.evaluators("project-1")
+    assert [item["id"] for item in evaluators] == ["rule-1"]
+    assert captured["project_id"] == "project-1"

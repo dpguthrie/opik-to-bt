@@ -340,6 +340,29 @@ class OpikSource:
     ) -> list[Any]:
         return await self._collect(self.trace_pages(project_name, start=start, end=end))
 
+    async def evaluator_pages(self, project_id: str, *, start_page: int = 1) -> AsyncIterator[Page]:
+        client = getattr(self.client.rest_client, "automation_rule_evaluators", None)
+        find = None
+        if client is not None:
+            find = getattr(client, "find_evaluators", None) or getattr(
+                client, "find_automation_rule_evaluators", None
+            )
+        if find is None:
+            raise RuntimeError(
+                "This Opik SDK does not expose automation rule evaluators. "
+                "Upgrade the opik package to migrate scorers and online evals."
+            )
+        async for page in self._page_stream(
+            find,
+            project_id=project_id,
+            start_page=start_page,
+            request_size=min(self.page_size, 1000),
+        ):
+            yield page
+
+    async def evaluators(self, project_id: str) -> list[Any]:
+        return await self._collect(self.evaluator_pages(project_id))
+
     async def span_pages(
         self,
         project_name: str,

@@ -10,9 +10,13 @@ from opik_to_bt.checkpoint import Checkpoint
 from opik_to_bt.config import PromptHistory, Resource, parse_datetime
 from opik_to_bt.mapping import (
     dataset_event,
+    evaluator_scope,
+    evaluator_type,
     experiment_events,
+    online_score_payload,
     prompt_definition,
     prompt_slug,
+    scorer_definitions,
     span_event,
     trace_event,
 )
@@ -32,6 +36,8 @@ class Selection:
     end: datetime | None
     prompts: set[str] | None = None
     prompt_history: PromptHistory = PromptHistory.LATEST
+    scorers: set[str] | None = None
+    online_evals: set[str] | None = None
     dry_run: bool = False
 
 
@@ -151,11 +157,15 @@ class Migrator:
             )
         if Resource.PROMPTS in selection.resources:
             independent.append(self._prompts(source_project_id, target_project_id, selection))
+        if Resource.SCORERS in selection.resources:
+            independent.append(self._scorers(source_project_id, target_project_id, selection))
         if independent:
             await asyncio.gather(*independent)
         # Keep related datasets available before their experiment results.
         if Resource.EXPERIMENTS in selection.resources:
             await self._experiments(source_project_id, target_project_id, selection)
+        if Resource.ONLINE_EVALS in selection.resources:
+            await self._online_evals(source_project_id, target_project_id, selection)
 
     @staticmethod
     def _prompt_version_id(version: Any) -> str:
@@ -171,6 +181,28 @@ class Migrator:
         return all(current.get(field) == definition.get(field) for field in fields) and (
             current.get("tags") or []
         ) == (definition.get("tags") or [])
+
+    @staticmethod
+    def _function_matches(current: dict[str, Any], definition: dict[str, Any]) -> bool:
+        fields = (
+            "name",
+            "slug",
+            "description",
+            "function_type",
+            "function_data",
+            "prompt_data",
+        )
+        return all(current.get(field) == definition.get(field) for field in fields) and (
+            current.get("tags") or []
+        ) == (definition.get("tags") or [])
+
+    @staticmethod
+    def _online_score_matches(current: dict[str, Any], definition: dict[str, Any]) -> bool:
+        return (
+            current.get("name") == definition.get("name")
+            and current.get("score_type") == definition.get("score_type")
+            and current.get("config") == definition.get("config")
+        )
 
     async def _prompts(
         self, source_project_id: str, target_project_id: str, selection: Selection
@@ -327,6 +359,106 @@ class Migrator:
 
         self.checkpoint.mark_completed(completion_key)
         self.progress.complete(task, items=len(versions), partitions=0)
+
+    async def _evaluators(self, source_project_id: str, names: set[str] | None) -> list[Any]:
+        return [
+            item
+            for item in await self.source.evaluators(source_project_id)
+            if selected(as_dict(item)["name"], names)
+        ]
+
+    async def _scorers(
+        self, source_project_id: str, target_project_id: str, selection: Selection
+    ) -> None:
+        evaluators = await self._evaluators(source_project_id, selection.scorers)
+        await bounded_gather(
+            evaluators,
+            lambda evaluator: self._resource(self._write_scorers, evaluator, target_project_id),
+            self.tuning.resource_workers,
+        )
+
+    async def _write_scorers(self, evaluator: Any, target_project_id: str) -> list[str]:
+        raw = as_dict(evaluator)
+        source_id = str(raw["id"])
+        completion_key = f"scorer:{source_id}"
+        functions_key = f"scorer:{source_id}:functions"
+        if self.checkpoint.completed(completion_key):
+            self.progress.checkpointed(f"scorer {raw['name']}")
+            stored = self.checkpoint.value(functions_key) or {}
+            return list(stored.values())
+
+        definitions, skip = scorer_definitions(evaluator)
+        if skip:
+            self.progress.message(f"  scorer {raw['name']}: skipped — {skip}")
+            self.checkpoint.set_value(functions_key, {})
+            self.checkpoint.mark_completed(completion_key)
+            return []
+
+        task = self.progress.start(f"scorer · {raw['name']}")
+        migrated = dict(self.checkpoint.value(functions_key) or {})
+        function_ids = []
+        for definition in definitions:
+            slug = str(definition["slug"])
+            if slug in migrated:
+                function_ids.append(migrated[slug])
+                continue
+            current = await self.target.get_function(target_project_id, slug)
+            if current is not None and self._function_matches(current, definition):
+                written = current
+            else:
+                written = await self.target.write_function(
+                    target_project_id,
+                    definition,
+                    update=current is not None,
+                )
+            function_id = str(written["id"])
+            migrated[slug] = function_id
+            function_ids.append(function_id)
+            self.checkpoint.set_target("scorer", f"{source_id}:{slug}", function_id)
+            self.checkpoint.set_value(functions_key, migrated)
+
+        self.checkpoint.mark_completed(completion_key)
+        self.progress.complete(task, items=len(definitions), partitions=0)
+        return function_ids
+
+    async def _online_evals(
+        self, source_project_id: str, target_project_id: str, selection: Selection
+    ) -> None:
+        evaluators = await self._evaluators(source_project_id, selection.online_evals)
+        await bounded_gather(
+            evaluators,
+            lambda evaluator: self._resource(self._online_eval, evaluator, target_project_id),
+            self.tuning.resource_workers,
+        )
+
+    async def _online_eval(self, evaluator: Any, target_project_id: str) -> None:
+        raw = as_dict(evaluator)
+        source_id = str(raw["id"])
+        completion_key = f"online-eval:{source_id}"
+        if self.checkpoint.completed(completion_key):
+            self.progress.checkpointed(f"online eval {raw['name']}")
+            return
+
+        function_ids = await self._write_scorers(evaluator, target_project_id)
+        payload, skip = online_score_payload(evaluator, function_ids)
+        if skip:
+            self.progress.message(f"  online eval {raw['name']}: skipped — {skip}")
+            self.checkpoint.mark_completed(completion_key)
+            return
+
+        task = self.progress.start(f"online eval · {raw['name']}")
+        current = await self.target.get_project_score(target_project_id, payload["name"])
+        if current is not None and self._online_score_matches(current, payload):
+            written = current
+        else:
+            written = await self.target.write_project_score(
+                target_project_id,
+                payload,
+                update=current is not None,
+            )
+        self.checkpoint.set_target("online-eval", source_id, str(written["id"]))
+        self.checkpoint.mark_completed(completion_key)
+        self.progress.complete(task, items=1, partitions=0)
 
     async def _datasets(
         self, source_project_id: str, target_project_id: str, selection: Selection
@@ -582,4 +714,55 @@ class Migrator:
                 parts.append(
                     f"{len(prompts)} prompt(s), {selection.prompt_history.value} version mode"
                 )
+            extra: list[str] = []
+            details: list[str] = []
+            if (
+                Resource.SCORERS in selection.resources
+                or Resource.ONLINE_EVALS in selection.resources
+            ):
+                extra, details = await self._inventory_evaluators(raw["id"], selection)
+            parts.extend(extra)
             self.progress.message(f"  {raw['name']}: {', '.join(parts)}")
+            for line in details:
+                self.progress.message(line)
+
+    async def _inventory_evaluators(
+        self, source_project_id: str, selection: Selection
+    ) -> tuple[list[str], list[str]]:
+        evaluators = await self.source.evaluators(source_project_id)
+        scorer_count = 0
+        online_count = 0
+        details: list[str] = []
+        extra: list[str] = []
+        for evaluator in evaluators:
+            raw = as_dict(evaluator)
+            include_scorer = Resource.SCORERS in selection.resources and selected(
+                raw["name"], selection.scorers
+            )
+            include_online = Resource.ONLINE_EVALS in selection.resources and selected(
+                raw["name"], selection.online_evals
+            )
+            if not include_scorer and not include_online:
+                continue
+            definitions, scorer_skip = scorer_definitions(evaluator)
+            if include_scorer:
+                scorer_count += 1
+            function_ids = [f"dry-run-{index}" for index in range(len(definitions))]
+            _, online_skip = online_score_payload(evaluator, function_ids)
+            if include_online:
+                online_count += 1
+            kind = evaluator_type(evaluator) or "unknown"
+            scope = evaluator_scope(evaluator) or "n/a"
+            scorer_status = f"skipped — {scorer_skip}" if scorer_skip else "translate"
+            online_status = f"skipped — {online_skip}" if online_skip else "translate"
+            bits = []
+            if include_scorer:
+                bits.append(f"scorer {scorer_status}")
+            if include_online:
+                bits.append(f"online {online_status}")
+            details.append(f"    {raw['name']} ({kind}/{scope}): {', '.join(bits)}")
+        if Resource.SCORERS in selection.resources:
+            extra.append(f"{scorer_count} scorer(s) [opt-in]")
+        if Resource.ONLINE_EVALS in selection.resources:
+            extra.append(f"{online_count} online eval(s) [opt-in]")
+        return extra, details
