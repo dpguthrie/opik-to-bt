@@ -14,6 +14,14 @@ class Resource(StrEnum):
     EXPERIMENTS = "experiments"
     LOGS = "logs"
     PROMPTS = "prompts"
+    SCORERS = "scorers"
+    ONLINE_EVALS = "online-evals"
+    REVIEW_SCORES = "review-scores"
+    ANNOTATION_QUEUES = "annotation-queues"
+    DASHBOARDS = "dashboards"
+
+
+DEFAULT_RESOURCES = frozenset(Resource)
 
 
 class PromptHistory(StrEnum):
@@ -42,15 +50,18 @@ def parse_csv(value: str | None) -> set[str] | None:
 
 def parse_resources(value: str) -> set[Resource]:
     names = parse_csv(value) or {"all"}
+    selected: set[Resource] = set()
     if "all" in names:
-        return set(Resource)
+        selected = set(DEFAULT_RESOURCES)
+        names = names - {"all"}
     try:
-        return {Resource(name) for name in names}
+        selected |= {Resource(name) for name in names}
     except ValueError as exc:
         allowed = ", ".join(resource.value for resource in Resource)
         raise ValueError(
-            f"Resources must be 'all' or a comma-separated subset of: {allowed}"
+            f"Resources must be 'all' or a comma-separated subset of: {allowed}."
         ) from exc
+    return selected
 
 
 class Settings(BaseSettings):

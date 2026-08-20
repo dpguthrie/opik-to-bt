@@ -20,6 +20,7 @@ def test_parse_csv_and_resources() -> None:
         Resource.PROMPTS,
     }
     assert parse_resources("all") == set(Resource)
+    assert parse_resources("all,scorers,online-evals") == set(Resource)
 
 
 def test_parse_datetime_normalizes_utc() -> None:

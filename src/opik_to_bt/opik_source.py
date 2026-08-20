@@ -340,6 +340,143 @@ class OpikSource:
     ) -> list[Any]:
         return await self._collect(self.trace_pages(project_name, start=start, end=end))
 
+    async def evaluator_pages(self, project_id: str, *, start_page: int = 1) -> AsyncIterator[Page]:
+        client = getattr(self.client.rest_client, "automation_rule_evaluators", None)
+        find = None
+        if client is not None:
+            find = getattr(client, "find_evaluators", None) or getattr(
+                client, "find_automation_rule_evaluators", None
+            )
+        if find is None:
+            raise RuntimeError(
+                "This Opik SDK does not expose automation rule evaluators. "
+                "Upgrade the opik package to migrate scorers and online evals."
+            )
+        async for page in self._page_stream(
+            find,
+            project_id=project_id,
+            start_page=start_page,
+            request_size=min(self.page_size, 1000),
+        ):
+            yield page
+
+    async def evaluators(self, project_id: str) -> list[Any]:
+        return await self._collect(self.evaluator_pages(project_id))
+
+    async def feedback_definition_pages(self, *, start_page: int = 1) -> AsyncIterator[Page]:
+        client = getattr(self.client.rest_client, "feedback_definitions", None)
+        find = getattr(client, "find_feedback_definitions", None) if client else None
+        if find is None:
+            raise RuntimeError(
+                "This Opik SDK does not expose feedback definitions. "
+                "Upgrade the opik package to migrate human-review scores."
+            )
+        async for page in self._page_stream(
+            find,
+            start_page=start_page,
+            request_size=min(self.page_size, 1000),
+        ):
+            yield page
+
+    async def feedback_definitions(self) -> list[Any]:
+        return await self._collect(self.feedback_definition_pages())
+
+    async def annotation_queue_pages(
+        self, project_id: str, *, start_page: int = 1
+    ) -> AsyncIterator[Page]:
+        client = getattr(self.client.rest_client, "annotation_queues", None)
+        find = getattr(client, "find_annotation_queues", None) if client else None
+        if find is None:
+            raise RuntimeError(
+                "This Opik SDK does not expose annotation queues. "
+                "Upgrade the opik package to migrate human-review queues."
+            )
+        filters = json.dumps(
+            [
+                {
+                    "field": "project_id",
+                    "type": "string",
+                    "operator": "=",
+                    "value": project_id,
+                }
+            ]
+        )
+        async for page in self._page_stream(
+            find,
+            filters=filters,
+            start_page=start_page,
+            request_size=min(self.page_size, 1000),
+        ):
+            yield page
+
+    async def annotation_queues(self, project_id: str) -> list[Any]:
+        return await self._collect(self.annotation_queue_pages(project_id))
+
+    async def dashboard_pages(
+        self, project_id: str | None = None, *, start_page: int = 1
+    ) -> AsyncIterator[Page]:
+        client = getattr(self.client.rest_client, "dashboards", None)
+        find = getattr(client, "find_dashboards", None) if client else None
+        if find is None:
+            raise RuntimeError(
+                "This Opik SDK does not expose dashboards. "
+                "Upgrade the opik package to migrate Monitor views."
+            )
+        kwargs: dict[str, Any] = {}
+        if project_id:
+            kwargs["project_id"] = project_id
+        async for page in self._page_stream(
+            find,
+            start_page=start_page,
+            request_size=min(self.page_size, 1000),
+            **kwargs,
+        ):
+            yield page
+
+    async def dashboards(self, project_id: str | None = None) -> list[Any]:
+        return await self._collect(self.dashboard_pages(project_id))
+
+    async def annotation_queue_trace_pages(
+        self, project_id: str, queue_id: str, *, start_page: int = 1
+    ) -> AsyncIterator[Page]:
+        async for page in self._page_stream(
+            self.client.rest_client.traces.get_traces_by_project,
+            project_id=project_id,
+            annotation_queue_id=queue_id,
+            truncate=True,
+            start_page=start_page,
+        ):
+            yield page
+
+    async def annotation_queue_traces(self, project_id: str, queue_id: str) -> list[Any]:
+        return await self._collect(self.annotation_queue_trace_pages(project_id, queue_id))
+
+    async def annotation_queue_thread_pages(
+        self, project_id: str, queue_id: str, *, start_page: int = 1
+    ) -> AsyncIterator[Page]:
+        async for page in self._page_stream(
+            self.client.rest_client.traces.get_trace_threads,
+            project_id=project_id,
+            annotation_queue_id=queue_id,
+            truncate=True,
+            start_page=start_page,
+        ):
+            yield page
+
+    async def annotation_queue_threads(self, project_id: str, queue_id: str) -> list[Any]:
+        return await self._collect(self.annotation_queue_thread_pages(project_id, queue_id))
+
+    async def traces_for_thread(self, project_id: str, thread_id: str) -> list[Any]:
+        filters = json.dumps([{"field": "thread_id", "operator": "=", "value": thread_id}])
+        return await self._collect(
+            self._page_stream(
+                self.client.rest_client.traces.get_traces_by_project,
+                project_id=project_id,
+                filters=filters,
+                truncate=True,
+            )
+        )
+
     async def span_pages(
         self,
         project_name: str,

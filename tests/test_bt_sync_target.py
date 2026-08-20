@@ -112,6 +112,129 @@ async def test_prompt_writes_resolve_real_project_and_use_rest_api(tmp_path) -> 
     ]
 
 
+async def test_function_and_project_score_writes_use_rest_api(tmp_path) -> None:
+    requests = []
+    target = BtSyncTarget(tmp_path, settings())
+    project = await target.create_project("my project", None)
+
+    def fake_request(method, path, payload=None):
+        requests.append((method, path, payload))
+        if path.startswith("/v1/project?"):
+            return {"objects": []}
+        if path == "/v1/project":
+            return {"id": "project-1"}
+        if method == "GET":
+            return {"objects": []}
+        kind = "fn-1" if "function" in path else "score-1"
+        return {"id": kind, **(payload or {})}
+
+    target._request = fake_request
+    function = {
+        "name": "Hallucination",
+        "slug": "hallucination-12345678",
+        "function_type": "scorer",
+        "function_data": {"type": "prompt"},
+        "prompt_data": {"prompt": {"type": "chat", "messages": []}},
+    }
+    score = {
+        "name": "Hallucination",
+        "score_type": "online",
+        "config": {"online": {"sampling_rate": 1, "scorers": []}},
+    }
+
+    assert await target.get_function(project, function["slug"]) is None
+    await target.write_function(project, function, update=False)
+    await target.write_function(project, function, update=True)
+    assert await target.get_project_score(project, score["name"]) is None
+    await target.write_project_score(project, score, update=False)
+    await target.write_project_score(project, score, update=True)
+
+    assert ("POST", "/v1/function", {"project_id": "project-1", **function}) in requests
+    assert ("PUT", "/v1/function", {"project_id": "project-1", **function}) in requests
+    assert ("POST", "/v1/project_score", {"project_id": "project-1", **score}) in requests
+    assert ("PUT", "/v1/project_score", {"project_id": "project-1", **score}) in requests
+
+
+async def test_view_and_review_flag_writes_use_rest_api(tmp_path) -> None:
+    requests = []
+    target = BtSyncTarget(tmp_path, settings())
+    project = await target.create_project("my project", None)
+
+    def fake_request(method, path, payload=None):
+        requests.append((method, path, payload))
+        if path.startswith("/v1/project?"):
+            return {"objects": []}
+        if path == "/v1/project":
+            return {"id": "project-1"}
+        if method == "GET":
+            return {"objects": []}
+        return {"id": "view-1", **(payload or {})}
+
+    target._request = fake_request
+    view = {
+        "name": "Hallucination backlog",
+        "object_type": "project",
+        "view_type": "for_review_project_log",
+        "view_data": {"search": {"filter": ["metadata.opik_annotation_queue_id = 'queue-1'"]}},
+        "options": {"layout": "kanban"},
+    }
+    events = [{"id": "opik:trace:trace-9", "_is_merge": True}]
+
+    assert await target.get_view(project, view["name"], view_type=view["view_type"]) is None
+    await target.write_view(project, view, update=False)
+    await target.write_view(project, view, update=True)
+    await target.flag_logs_for_review(project, events)
+
+    assert (
+        "POST",
+        "/v1/view",
+        {"object_id": "project-1", **view},
+    ) in requests
+    assert (
+        "PUT",
+        "/v1/view",
+        {"object_id": "project-1", **view},
+    ) in requests
+    assert (
+        "POST",
+        "/v1/project_logs/project-1/insert",
+        {"events": events},
+    ) in requests
+
+
+async def test_monitor_view_writes_inject_project_id(tmp_path) -> None:
+    requests = []
+    target = BtSyncTarget(tmp_path, settings())
+    project = await target.create_project("my project", None)
+
+    def fake_request(method, path, payload=None):
+        requests.append((method, path, payload))
+        if path.startswith("/v1/project?"):
+            return {"objects": []}
+        if path == "/v1/project":
+            return {"id": "project-1"}
+        if method == "GET":
+            return {"objects": []}
+        return {"id": "view-1", **(payload or {})}
+
+    target._request = fake_request
+    view = {
+        "name": "Prod overview",
+        "object_type": "project",
+        "view_type": "monitor",
+        "view_data": {"custom_charts": [{"id": "w-traces", "chartType": "timeseries"}]},
+        "options": {
+            "viewType": "monitor",
+            "options": {"type": "project", "spanType": "range", "rangeValue": "7d"},
+        },
+    }
+    await target.write_view(project, view, update=False)
+    posted = next(
+        payload for method, path, payload in requests if method == "POST" and path == "/v1/view"
+    )
+    assert posted["options"]["options"]["projectId"] == "project-1"
+
+
 async def test_each_partition_gets_independent_bt_sync_state(tmp_path, monkeypatch) -> None:
     commands = []
 

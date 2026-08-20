@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "opik-to-bt"
 version = "0.1.0"
-description = "Migrate Opik prompts, datasets, experiments, and traces to Braintrust"
+description = "Migrate Opik prompts, datasets, experiments, traces, scorers, online evals, and human review to Braintrust"
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
 license = "MIT"

@@ -1,10 +1,19 @@
 import pytest
 
 from opik_to_bt.mapping import (
+    dashboard_view_payload,
     dataset_event,
     experiment_events,
+    filters_to_sql,
+    online_score_payload,
     prompt_definition,
     prompt_slug,
+    queue_reviewer_notes,
+    review_flag_event,
+    review_score_payload,
+    review_view_payload,
+    rewrite_judge_template,
+    scorer_definitions,
     span_event,
     trace_event,
     trace_events,
@@ -315,3 +324,335 @@ def test_trace_and_span_feedback_and_standard_metrics() -> None:
     assert span["metrics"]["estimated_cost"] == 0.01
     assert span["metrics"]["time_to_first_token"] == 0.25
     assert span["metrics"]["end"] - span["metrics"]["start"] == pytest.approx(0.425)
+
+
+def test_trace_copies_thread_id_for_grouped_online_scoring() -> None:
+    trace = trace_event(
+        {
+            "id": "trace-1",
+            "thread_id": "thread-9",
+            "start_time": "2026-01-01T00:00:00Z",
+        }
+    )
+    assert trace["metadata"]["thread_id"] == "thread-9"
+    assert trace["metadata"]["opik"]["thread_id"] == "thread-9"
+
+
+def _judge_evaluator(**overrides):
+    evaluator = {
+        "id": "rule-1",
+        "name": "Hallucination",
+        "type": "llm_as_judge",
+        "enabled": True,
+        "sampling_rate": 0.5,
+        "code": {
+            "model": {"name": "gpt-4o", "temperature": 0},
+            "variables": {"answer": "output", "question": "input"},
+            "messages": [
+                {"role": "SYSTEM", "content": "Judge the answer."},
+                {"role": "USER", "content": "Q: {{question}}\nA: {{answer}}"},
+            ],
+            "schema": [
+                {
+                    "name": "hallucination",
+                    "type": "BOOLEAN",
+                    "description": "Whether the answer is grounded",
+                }
+            ],
+        },
+    }
+    evaluator.update(overrides)
+    return evaluator
+
+
+def test_llm_judge_scorer_rewrites_variables_and_boolean_choices() -> None:
+    definitions, skip = scorer_definitions(_judge_evaluator())
+    assert skip is None
+    assert len(definitions) == 1
+    definition = definitions[0]
+    assert definition["function_type"] == "scorer"
+    assert definition["function_data"] == {"type": "prompt"}
+    messages = definition["prompt_data"]["prompt"]["messages"]
+    assert messages[0] == {"role": "system", "content": "Judge the answer."}
+    assert messages[1]["content"] == "Q: {{input}}\nA: {{output}}"
+    assert "true or false" in messages[2]["content"]
+    assert definition["prompt_data"]["parser"]["choice_scores"] == {"true": 1.0, "false": 0.0}
+    assert definition["prompt_data"]["options"]["model"] == "gpt-4o"
+
+
+def test_multi_score_schema_becomes_one_scorer_per_field() -> None:
+    evaluator = _judge_evaluator()
+    evaluator["code"]["schema"] = [
+        {"name": "relevance", "type": "BOOLEAN", "description": ""},
+        {"name": "quality", "type": "DOUBLE", "description": "0 to 1"},
+    ]
+    definitions, skip = scorer_definitions(evaluator)
+    assert skip is None
+    assert [item["name"] for item in definitions] == [
+        "Hallucination · relevance",
+        "Hallucination · quality",
+    ]
+    assert definitions[1]["prompt_data"]["parser"]["choice_scores"]["0.5"] == 0.5
+
+
+def test_sdk_schema_alias_is_read_from_pydantic_field_name() -> None:
+    evaluator = _judge_evaluator()
+    code = evaluator["code"]
+    code["schema_"] = code.pop("schema")
+    definitions, skip = scorer_definitions(evaluator)
+    assert skip is None
+    assert definitions[0]["prompt_data"]["parser"]["choice_scores"] == {
+        "true": 1.0,
+        "false": 0.0,
+    }
+
+
+def test_python_metric_is_skipped() -> None:
+    definitions, skip = scorer_definitions(
+        {"id": "py-1", "name": "Length", "type": "user_defined_metric_python"}
+    )
+    assert definitions == []
+    assert "Python" in skip
+
+
+def test_rewrite_judge_template_maps_thread_context() -> None:
+    assert rewrite_judge_template("See {{context}}", {"context": "context"}) == "See {{thread}}"
+
+
+def test_filters_to_sql_and_untranslated_fields() -> None:
+    sql, error = filters_to_sql(
+        [
+            {"field": "name", "operator": "=", "value": "chat"},
+            {"field": "tags", "operator": "contains", "value": "prod"},
+            {"field": "metadata", "operator": "!=", "key": "env", "value": "staging"},
+        ]
+    )
+    assert error is None
+    assert sql == (
+        "span_attributes.name = 'chat' AND tags IN ('prod') AND metadata.env IS NOT 'staging'"
+    )
+    _, error = filters_to_sql([{"field": "unknown", "operator": "=", "value": "x"}])
+    assert error == "filter field 'unknown' is not translated"
+
+
+def test_online_score_payload_trace_span_and_thread_scopes() -> None:
+    payload, skip = online_score_payload(_judge_evaluator(), ["fn-1"])
+    assert skip is None
+    online = payload["config"]["online"]
+    assert online["sampling_rate"] == 0.5
+    assert online["scorers"] == [{"type": "function", "id": "fn-1"}]
+    assert online["scope"] == {"type": "trace", "idle_seconds": 30}
+
+    span_rule = _judge_evaluator(type="span_llm_as_judge")
+    payload, skip = online_score_payload(span_rule, ["fn-1"])
+    assert payload["config"]["online"]["scope"] == {"type": "span"}
+
+    thread_rule = _judge_evaluator(type="trace_thread_llm_as_judge")
+    payload, skip = online_score_payload(thread_rule, ["fn-1"])
+    assert payload["config"]["online"]["scope"]["type"] == "group"
+    assert payload["config"]["online"]["scope"]["group_by"] == "metadata.thread_id"
+
+
+def test_online_score_skips_disabled_python_and_experiment_rules() -> None:
+    _, skip = online_score_payload(_judge_evaluator(enabled=False), ["fn-1"])
+    assert skip == "rule is disabled"
+    _, skip = online_score_payload(_judge_evaluator(trigger_scope="experiment"), ["fn-1"])
+    assert "experiment-only" in skip
+    _, skip = online_score_payload(_judge_evaluator(), [])
+    assert skip == "no translated scorers to attach"
+
+
+def test_numerical_and_boolean_feedback_definitions_become_review_scores() -> None:
+    slider, skip = review_score_payload(
+        {
+            "id": "def-1",
+            "name": "Quality",
+            "type": "numerical",
+            "description": "SME quality",
+            "details": {"min": 0, "max": 1},
+        }
+    )
+    assert skip is None
+    assert slider["score_type"] == "slider"
+    assert slider["description"] == "SME quality"
+
+    boolean, skip = review_score_payload(
+        {
+            "id": "def-2",
+            "name": "Grounded",
+            "type": "boolean",
+            "details": {"trueLabel": "yes", "falseLabel": "no"},
+        }
+    )
+    assert skip is None
+    assert boolean["score_type"] == "categorical"
+    assert boolean["categories"] == [
+        {"name": "yes", "value": 1.0},
+        {"name": "no", "value": 0.0},
+    ]
+
+
+def test_categorical_values_outside_unit_interval_are_rescaled() -> None:
+    payload, skip = review_score_payload(
+        {
+            "id": "def-3",
+            "name": "Severity",
+            "type": "categorical",
+            "details": {"categories": {"low": 1, "medium": 2, "high": 3}},
+        }
+    )
+    assert skip is None
+    values = {item["name"]: item["value"] for item in payload["categories"]}
+    assert values == {"low": 0.0, "medium": 0.5, "high": 1.0}
+    assert "rescaled" in payload["description"]
+
+
+def test_review_view_and_flag_events_use_queue_identity() -> None:
+    queue = {
+        "id": "queue-1",
+        "name": "Hallucination backlog",
+        "scope": "thread",
+        "instructions": "Mark grounded answers.",
+        "annotators_per_item": 2,
+        "feedback_definition_names": ["Grounded"],
+    }
+    view = review_view_payload(queue)
+    assert view["view_type"] == "for_review_project_log"
+    assert view["options"]["grouping"] == "metadata.thread_id"
+    assert "queue-1" in view["view_data"]["search"]["filter"][0]
+    assert "annotators_per_item=2" in queue_reviewer_notes(queue)
+
+    event = review_flag_event("trace-9", queue)
+    assert event["id"] == "opik:trace:trace-9"
+    assert event["_is_merge"] is True
+    assert event["metadata"]["~__bt_review_lists"]["__bt_default_review_list"]["status"] == (
+        "PENDING"
+    )
+
+
+def _dashboard(**overrides):
+    item = {
+        "id": "dash-1",
+        "name": "Prod overview",
+        "type": "multi_project",
+        "scope": "workspace",
+        "config": {
+            "sections": [
+                {
+                    "id": "sec-1",
+                    "title": "Traffic",
+                    "widgets": [
+                        {
+                            "id": "w-traces",
+                            "type": "project_metrics",
+                            "title": "Trace volume",
+                            "config": {
+                                "metricType": "TRACE_COUNT",
+                                "chartType": "line",
+                                "traceFilters": [
+                                    {
+                                        "field": "tags",
+                                        "operator": "contains",
+                                        "value": "prod",
+                                    }
+                                ],
+                                "breakdown": {"field": "model"},
+                            },
+                        },
+                        {
+                            "id": "w-latency",
+                            "type": "project_stats_card",
+                            "title": "P90 latency",
+                            "config": {"source": "traces", "metric": "duration.p90"},
+                        },
+                        {
+                            "id": "w-notes",
+                            "type": "text_markdown",
+                            "title": "Notes",
+                            "config": {"content": "Runbook"},
+                        },
+                    ],
+                }
+            ]
+        },
+    }
+    item.update(overrides)
+    return item
+
+
+def test_production_dashboard_becomes_monitor_charts() -> None:
+    payload, skip, notes = dashboard_view_payload(_dashboard())
+    assert skip is None
+    assert payload["view_type"] == "monitor"
+    charts = payload["view_data"]["custom_charts"]
+    assert [chart["chartType"] for chart in charts] == ["timeseries", "bignumber"]
+    traces, latency = charts
+    assert traces["measures"] == ["count(id)"]
+    assert traces["spanFilter"] == "is_root"
+    assert traces["traceFilter"] == "tags IN ('prod')"
+    assert traces["groupBy"] == "metadata.opik.model"
+    assert latency["measures"] == ["percentile(metrics.duration, 0.9)"]
+    assert latency["unit"] == "duration"
+    assert any("markdown is not a Monitor chart" in note for note in notes)
+
+
+def test_experiment_radar_and_insights_dashboards_are_skipped() -> None:
+    _, skip, notes = dashboard_view_payload(
+        _dashboard(
+            type="experiments",
+            config={
+                "sections": [
+                    {
+                        "widgets": [
+                            {
+                                "id": "w-radar",
+                                "type": "project_metrics",
+                                "title": "Scores",
+                                "config": {
+                                    "metricType": "FEEDBACK_SCORES",
+                                    "chartType": "radar",
+                                    "feedbackScores": ["Hallucination"],
+                                },
+                            }
+                        ]
+                    }
+                ]
+            },
+        )
+    )
+    assert "experiment dashboards" in skip
+    assert any("radar" in note for note in notes)
+
+    _, skip, _ = dashboard_view_payload(_dashboard(scope="insights"))
+    assert "Insights" in skip
+
+    payload, skip, notes = dashboard_view_payload(
+        _dashboard(
+            config={
+                "sections": [
+                    {
+                        "widgets": [
+                            {
+                                "id": "w-cost",
+                                "type": "project_metrics",
+                                "title": "Cost",
+                                "config": {"metric_type": "COST"},
+                            },
+                            {
+                                "id": "w-scores",
+                                "type": "project_metrics",
+                                "title": "Hallucination",
+                                "config": {
+                                    "metricType": "FEEDBACK_SCORES",
+                                    "feedbackScores": ["Hallucination"],
+                                },
+                            },
+                        ]
+                    }
+                ]
+            }
+        )
+    )
+    assert skip is None
+    measures = [chart["measures"] for chart in payload["view_data"]["custom_charts"]]
+    assert measures == [["sum(metrics.estimated_cost)"], ["avg(scores.Hallucination)"]]

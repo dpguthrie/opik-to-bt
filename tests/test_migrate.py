@@ -411,3 +411,439 @@ async def test_prompt_resume_recovers_write_before_checkpoint(tmp_path) -> None:
         "version-1": "xact-1",
         "version-2": "xact-2",
     }
+
+
+class EvaluatorSource:
+    def __init__(self, evaluators) -> None:
+        self._evaluators = evaluators
+
+    async def projects(self):
+        return [{"id": "project-1", "name": "selected"}]
+
+    async def evaluators(self, project_id):
+        del project_id
+        return self._evaluators
+
+
+class ScorerTarget:
+    def __init__(self) -> None:
+        self.functions = {}
+        self.function_writes = []
+        self.scores = {}
+        self.score_writes = []
+        self.next_function = 1
+        self.next_score = 1
+
+    async def check(self):
+        return None
+
+    async def create_project(self, name, description):
+        del name, description
+        return "bt-project"
+
+    async def get_function(self, project_id, slug):
+        del project_id
+        return self.functions.get(slug)
+
+    async def write_function(self, project_id, definition, *, update):
+        del project_id
+        written = {
+            "id": f"fn-{self.next_function}",
+            **definition,
+        }
+        self.next_function += 1
+        self.functions[definition["slug"]] = written
+        self.function_writes.append((update, definition))
+        return written
+
+    async def get_project_score(self, project_id, name):
+        del project_id
+        return self.scores.get(name)
+
+    async def write_project_score(self, project_id, definition, *, update):
+        del project_id
+        written = {"id": f"score-{self.next_score}", **definition}
+        self.next_score += 1
+        self.scores[definition["name"]] = written
+        self.score_writes.append((update, definition))
+        return written
+
+    async def get_view(self, project_id, name, *, view_type):
+        del project_id, view_type
+        return self.views.get(name) if hasattr(self, "views") else None
+
+    async def write_view(self, project_id, definition, *, update):
+        del project_id
+        if not hasattr(self, "views"):
+            self.views = {}
+            self.view_writes = []
+            self.next_view = 1
+        written = {"id": f"view-{self.next_view}", **definition}
+        self.next_view += 1
+        self.views[definition["name"]] = written
+        self.view_writes.append((update, definition))
+        return written
+
+    async def flag_logs_for_review(self, project_id, events):
+        del project_id
+        if not hasattr(self, "flagged"):
+            self.flagged = []
+        self.flagged.extend(events)
+
+
+def _judge(name="Hallucination", **overrides):
+    rule = {
+        "id": "rule-1",
+        "name": name,
+        "type": "llm_as_judge",
+        "enabled": True,
+        "sampling_rate": 1,
+        "code": {
+            "model": {"name": "gpt-4o", "temperature": 0},
+            "variables": {"output": "output"},
+            "messages": [{"role": "USER", "content": "Score {{output}}"}],
+            "schema": [{"name": "score", "type": "BOOLEAN", "description": "ok"}],
+        },
+    }
+    rule.update(overrides)
+    return rule
+
+
+def scorer_selection(*resources: Resource) -> Selection:
+    return Selection(
+        resources=set(resources),
+        projects=None,
+        datasets=None,
+        experiments=None,
+        start=None,
+        end=None,
+    )
+
+
+async def test_scorers_write_functions_and_resume(tmp_path) -> None:
+    source = EvaluatorSource([_judge()])
+    target = ScorerTarget()
+    checkpoint = Checkpoint(tmp_path / "checkpoint.json")
+    migrator = Migrator(source, target, checkpoint)
+
+    await migrator.run(scorer_selection(Resource.SCORERS))
+    await migrator.run(scorer_selection(Resource.SCORERS))
+
+    assert len(target.function_writes) == 1
+    assert target.score_writes == []
+    update, definition = target.function_writes[0]
+    assert update is False
+    assert definition["prompt_data"]["prompt"]["messages"][0]["content"] == "Score {{output}}"
+    assert checkpoint.completed("scorer:rule-1")
+
+
+async def test_online_evals_write_scorers_then_bind_the_rule(tmp_path) -> None:
+    source = EvaluatorSource([_judge()])
+    target = ScorerTarget()
+    checkpoint = Checkpoint(tmp_path / "checkpoint.json")
+
+    await Migrator(source, target, checkpoint).run(scorer_selection(Resource.ONLINE_EVALS))
+
+    assert len(target.function_writes) == 1
+    assert len(target.score_writes) == 1
+    _, payload = target.score_writes[0]
+    assert payload["score_type"] == "online"
+    assert payload["config"]["online"]["scorers"] == [{"type": "function", "id": "fn-1"}]
+    assert payload["config"]["online"]["scope"]["type"] == "trace"
+    assert checkpoint.completed("scorer:rule-1")
+    assert checkpoint.completed("online-eval:rule-1")
+
+
+async def test_dry_run_inventories_opt_in_scorers_and_online_evals(tmp_path) -> None:
+    class Capture:
+        def __init__(self) -> None:
+            self.lines: list[str] = []
+
+        def message(self, message: str) -> None:
+            self.lines.append(message)
+
+    source = EvaluatorSource(
+        [
+            _judge(),
+            {
+                "id": "py-1",
+                "name": "Length",
+                "type": "user_defined_metric_python",
+                "enabled": True,
+            },
+        ]
+    )
+    progress = Capture()
+    await Migrator(
+        source,
+        object(),
+        Checkpoint(tmp_path / "checkpoint.json"),
+        progress=progress,
+    ).run(
+        Selection(
+            resources={Resource.SCORERS, Resource.ONLINE_EVALS},
+            projects=None,
+            datasets=None,
+            experiments=None,
+            start=None,
+            end=None,
+            dry_run=True,
+        )
+    )
+    joined = "\n".join(progress.lines)
+    assert "2 scorer(s)" in joined
+    assert "2 online eval(s)" in joined
+    assert "Warning: online scoring will score new production logs" in joined
+    assert "Hallucination (llm_as_judge/trace): scorer translate, online translate" in joined
+    assert "Length (user_defined_metric_python/trace): scorer skipped" in joined
+
+
+async def test_python_metrics_skip_and_disabled_rules_keep_scorers(tmp_path) -> None:
+    source = EvaluatorSource(
+        [
+            {
+                "id": "py-1",
+                "name": "Length",
+                "type": "user_defined_metric_python",
+                "enabled": True,
+            },
+            _judge(id="rule-2", enabled=False),
+        ]
+    )
+    target = ScorerTarget()
+    checkpoint = Checkpoint(tmp_path / "checkpoint.json")
+
+    await Migrator(source, target, checkpoint).run(
+        scorer_selection(Resource.SCORERS, Resource.ONLINE_EVALS)
+    )
+
+    assert len(target.function_writes) == 1
+    assert target.function_writes[0][1]["name"] == "Hallucination"
+    assert target.score_writes == []
+    assert checkpoint.completed("scorer:py-1")
+    assert checkpoint.completed("scorer:rule-2")
+    assert checkpoint.completed("online-eval:py-1")
+    assert checkpoint.completed("online-eval:rule-2")
+
+
+class ReviewSource:
+    def __init__(self, definitions, queues, traces=None, threads=None) -> None:
+        self._definitions = definitions
+        self._queues = queues
+        self._traces = traces or []
+        self._threads = threads or []
+
+    async def projects(self):
+        return [{"id": "project-1", "name": "selected"}]
+
+    async def feedback_definitions(self):
+        return self._definitions
+
+    async def annotation_queues(self, project_id):
+        del project_id
+        return self._queues
+
+    async def annotation_queue_traces(self, project_id, queue_id):
+        del project_id, queue_id
+        return self._traces
+
+    async def annotation_queue_threads(self, project_id, queue_id):
+        del project_id, queue_id
+        return self._threads
+
+    async def traces_for_thread(self, project_id, thread_id):
+        del project_id
+        return [
+            trace for trace in self._traces if as_dict_trace(trace).get("thread_id") == thread_id
+        ]
+
+
+def as_dict_trace(trace):
+    return trace if isinstance(trace, dict) else {}
+
+
+def _definition(**overrides):
+    item = {
+        "id": "def-1",
+        "name": "Grounded",
+        "type": "boolean",
+        "details": {"true_label": "yes", "false_label": "no"},
+    }
+    item.update(overrides)
+    return item
+
+
+def _queue(**overrides):
+    item = {
+        "id": "queue-1",
+        "name": "Hallucination backlog",
+        "project_id": "project-1",
+        "scope": "trace",
+        "instructions": "Mark grounded answers.",
+        "feedback_definition_names": ["Grounded"],
+        "items_count": 1,
+    }
+    item.update(overrides)
+    return item
+
+
+async def test_review_scores_write_human_review_widgets(tmp_path) -> None:
+    source = ReviewSource([_definition()], [])
+    target = ScorerTarget()
+    checkpoint = Checkpoint(tmp_path / "checkpoint.json")
+
+    await Migrator(source, target, checkpoint).run(scorer_selection(Resource.REVIEW_SCORES))
+    await Migrator(source, target, checkpoint).run(scorer_selection(Resource.REVIEW_SCORES))
+
+    assert len(target.score_writes) == 1
+    _, payload = target.score_writes[0]
+    assert payload["score_type"] == "categorical"
+    assert checkpoint.completed("review-score:project-1:def-1")
+
+
+async def test_annotation_queues_write_review_scores_then_flag_items(tmp_path) -> None:
+    source = ReviewSource(
+        [_definition()],
+        [_queue()],
+        traces=[{"id": "trace-9", "thread_id": None}],
+    )
+    target = ScorerTarget()
+    checkpoint = Checkpoint(tmp_path / "checkpoint.json")
+
+    await Migrator(source, target, checkpoint).run(scorer_selection(Resource.ANNOTATION_QUEUES))
+
+    assert target.score_writes[0][1]["name"] == "Grounded"
+    assert target.view_writes[0][1]["view_type"] == "for_review_project_log"
+    assert [event["id"] for event in target.flagged] == ["opik:trace:trace-9"]
+    assert checkpoint.completed("annotation-queue:queue-1")
+
+
+async def test_thread_queues_flag_traces_in_the_thread(tmp_path) -> None:
+    source = ReviewSource(
+        [_definition()],
+        [_queue(scope="thread")],
+        traces=[{"id": "trace-a", "thread_id": "thread-1"}],
+        threads=[{"id": "thread-1"}],
+    )
+    target = ScorerTarget()
+
+    await Migrator(source, target, Checkpoint(tmp_path / "checkpoint.json")).run(
+        scorer_selection(Resource.ANNOTATION_QUEUES)
+    )
+
+    assert [event["id"] for event in target.flagged] == ["opik:trace:trace-a"]
+    assert target.view_writes[0][1]["options"]["grouping"] == "metadata.thread_id"
+
+
+class DashboardSource:
+    def __init__(self, dashboards) -> None:
+        self._dashboards = dashboards
+
+    async def projects(self):
+        return [{"id": "project-1", "name": "selected"}]
+
+    async def dashboards(self, project_id=None):
+        if project_id is None:
+            return [item for item in self._dashboards if not as_dict_trace(item).get("project_id")]
+        return [
+            item
+            for item in self._dashboards
+            if as_dict_trace(item).get("project_id") in (None, project_id)
+        ]
+
+
+def _dashboard(**overrides):
+    item = {
+        "id": "dash-1",
+        "name": "Prod overview",
+        "type": "multi_project",
+        "scope": "workspace",
+        "config": {
+            "sections": [
+                {
+                    "widgets": [
+                        {
+                            "id": "w-traces",
+                            "type": "project_metrics",
+                            "title": "Trace volume",
+                            "config": {"metricType": "TRACE_COUNT"},
+                        },
+                        {
+                            "id": "w-notes",
+                            "type": "text_markdown",
+                            "title": "Notes",
+                            "config": {"content": "n/a"},
+                        },
+                    ]
+                }
+            ]
+        },
+    }
+    item.update(overrides)
+    return item
+
+
+async def test_dashboards_write_monitor_views_and_resume(tmp_path) -> None:
+    source = DashboardSource([_dashboard()])
+    target = ScorerTarget()
+    checkpoint = Checkpoint(tmp_path / "checkpoint.json")
+
+    await Migrator(source, target, checkpoint).run(scorer_selection(Resource.DASHBOARDS))
+    await Migrator(source, target, checkpoint).run(scorer_selection(Resource.DASHBOARDS))
+
+    assert len(target.view_writes) == 1
+    _, payload = target.view_writes[0]
+    assert payload["view_type"] == "monitor"
+    assert payload["view_data"]["custom_charts"][0]["measures"] == ["count(id)"]
+    assert checkpoint.completed("dashboard:project-1:dash-1")
+
+
+async def test_experiment_dashboards_are_inventoried_not_written(tmp_path) -> None:
+    source = DashboardSource([_dashboard(type="experiments")])
+    target = ScorerTarget()
+    checkpoint = Checkpoint(tmp_path / "checkpoint.json")
+
+    await Migrator(source, target, checkpoint).run(scorer_selection(Resource.DASHBOARDS))
+
+    assert getattr(target, "view_writes", []) == []
+    assert checkpoint.completed("dashboard:project-1:dash-1")
+
+
+async def test_dry_run_inventories_dashboard_widgets(tmp_path) -> None:
+    class Capture:
+        def __init__(self) -> None:
+            self.lines: list[str] = []
+
+        def message(self, message: str) -> None:
+            self.lines.append(message)
+
+    source = DashboardSource(
+        [
+            _dashboard(),
+            _dashboard(id="dash-2", name="Eval board", type="experiments"),
+        ]
+    )
+    progress = Capture()
+    await Migrator(
+        source,
+        object(),
+        Checkpoint(tmp_path / "checkpoint.json"),
+        progress=progress,
+    ).run(
+        Selection(
+            resources={Resource.DASHBOARDS},
+            projects=None,
+            datasets=None,
+            experiments=None,
+            start=None,
+            end=None,
+            dry_run=True,
+        )
+    )
+    joined = "\n".join(progress.lines)
+    assert "2 dashboard(s)" in joined
+    assert "Prod overview (multi_project/workspace): translate" in joined
+    assert "Eval board (experiments/workspace): skipped" in joined
+    assert "widget Trace volume: timeseries count(id)" in joined
+    assert "markdown is not a Monitor chart" in joined
+    assert "Custom charts require a Braintrust Pro or Enterprise plan" in joined

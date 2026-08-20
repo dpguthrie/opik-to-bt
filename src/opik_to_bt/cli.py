@@ -24,7 +24,11 @@ def main(
     ] = None,
     resources: Annotated[
         str,
-        typer.Option(help="all, or a comma-separated list: datasets,experiments,logs,prompts."),
+        typer.Option(
+            help="all, or a comma-separated subset of datasets, experiments, logs, "
+            "prompts, scorers, online-evals, review-scores, annotation-queues, "
+            "and dashboards."
+        ),
     ] = "all",
     datasets: Annotated[
         str | None, typer.Option(help="Optional comma-separated dataset names.")
@@ -34,6 +38,34 @@ def main(
     ] = None,
     prompts: Annotated[
         str | None, typer.Option(help="Optional comma-separated prompt names.")
+    ] = None,
+    scorers: Annotated[
+        str | None, typer.Option(help="Optional comma-separated online-eval / scorer names.")
+    ] = None,
+    online_evals: Annotated[
+        str | None,
+        typer.Option(
+            "--online-evals",
+            help="Optional comma-separated online evaluation rule names.",
+        ),
+    ] = None,
+    review_scores: Annotated[
+        str | None,
+        typer.Option(
+            "--review-scores",
+            help="Optional comma-separated human-review score / feedback-definition names.",
+        ),
+    ] = None,
+    annotation_queues: Annotated[
+        str | None,
+        typer.Option(
+            "--annotation-queues",
+            help="Optional comma-separated annotation queue names.",
+        ),
+    ] = None,
+    dashboards: Annotated[
+        str | None,
+        typer.Option(help="Optional comma-separated dashboard names."),
     ] = None,
     prompt_history: Annotated[
         PromptHistory | None,
@@ -71,6 +103,11 @@ def main(
             experiments=parse_csv(experiments),
             prompts=parse_csv(prompts),
             prompt_history=prompt_history or settings.prompt_history,
+            scorers=parse_csv(scorers),
+            online_evals=parse_csv(online_evals),
+            review_scores=parse_csv(review_scores),
+            annotation_queues=parse_csv(annotation_queues),
+            dashboards=parse_csv(dashboards),
             start=start_at,
             end=end_at,
             dry_run=dry_run,

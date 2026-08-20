@@ -22,12 +22,20 @@ def tag_list(value: Any) -> list[str] | None:
     return list(tags) or None
 
 
-def prompt_slug(name: str, source_prompt_id: str) -> str:
+def object_slug(name: str, source_id: str, *, fallback: str = "opik-item") -> str:
     """Build a readable, deterministic Braintrust slug without name collisions."""
     normalized = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode()
-    stem = re.sub(r"[^a-z0-9]+", "-", normalized.lower()).strip("-") or "opik-prompt"
-    suffix = hashlib.sha256(source_prompt_id.encode()).hexdigest()[:8]
+    stem = re.sub(r"[^a-z0-9]+", "-", normalized.lower()).strip("-") or fallback
+    suffix = hashlib.sha256(source_id.encode()).hexdigest()[:8]
     return f"{stem[:80].rstrip('-')}-{suffix}"
+
+
+def prompt_slug(name: str, source_prompt_id: str) -> str:
+    return object_slug(name, source_prompt_id, fallback="opik-prompt")
+
+
+def scorer_slug(name: str, source_id: str) -> str:
+    return object_slug(name, source_id, fallback="opik-scorer")
 
 
 def prompt_definition(prompt: Any, version: Any) -> dict[str, Any]:
@@ -406,8 +414,15 @@ def trace_event(
             "tags": tag_list(raw_trace.get("tags")),
             "metadata": {
                 **(raw_trace.get("metadata") or {}),
+                **(
+                    {"thread_id": raw_trace["thread_id"]}
+                    if raw_trace.get("thread_id")
+                    and "thread_id" not in (raw_trace.get("metadata") or {})
+                    else {}
+                ),
                 "opik": {
                     "trace_id": raw_trace["id"],
+                    "thread_id": raw_trace.get("thread_id"),
                     "project_name": raw_trace.get("project_name"),
                     "feedback_scores": raw_trace.get("feedback_scores"),
                     "aggregate_usage": raw_trace.get("usage"),
@@ -483,3 +498,849 @@ def trace_events(trace: Any, spans: list[Any]) -> list[dict[str, Any]]:
         trace_event(trace, include_aggregate_metrics=not spans, spans=spans),
         *[span_event(raw_trace["id"], span) for span in spans],
     ]
+
+
+LLM_JUDGE_SCOPES = {
+    "llm_as_judge": "trace",
+    "span_llm_as_judge": "span",
+    "trace_thread_llm_as_judge": "group",
+}
+PYTHON_METRIC_TYPES = {
+    "user_defined_metric_python",
+    "span_user_defined_metric_python",
+    "trace_thread_user_defined_metric_python",
+}
+_VARIABLE_ROOTS = {
+    "input": "input",
+    "output": "output",
+    "expected": "expected",
+    "expected_output": "expected",
+    "context": "thread",
+    "metadata": "metadata",
+}
+_MESSAGE_ROLES = {
+    "system": "system",
+    "user": "user",
+    "ai": "assistant",
+    "assistant": "assistant",
+    "custom": "user",
+}
+_FILTER_FIELDS = {
+    "name": "span_attributes.name",
+    "type": "span_attributes.type",
+    "input": "input",
+    "output": "output",
+    "error": "error",
+    "error_info": "error",
+    "tags": "tags",
+    "thread_id": "metadata.thread_id",
+    "model": "metadata.opik.model",
+    "provider": "metadata.opik.provider",
+    "duration": "metrics.duration",
+    "total_estimated_cost": "metrics.estimated_cost",
+}
+_MUSTACHE = re.compile(r"\{\{\s*([^}]+?)\s*\}\}")
+THREAD_IDLE_SECONDS = 900.0
+NUMERIC_CHOICES = tuple(round(index / 10, 1) for index in range(11))
+
+
+def evaluator_type(evaluator: Any) -> str:
+    raw = as_dict(evaluator)
+    return str(raw.get("type") or "").lower()
+
+
+def evaluator_scope(evaluator: Any) -> str | None:
+    kind = evaluator_type(evaluator)
+    if kind in LLM_JUDGE_SCOPES:
+        return LLM_JUDGE_SCOPES[kind]
+    if kind == "span_user_defined_metric_python":
+        return "span"
+    if kind == "trace_thread_user_defined_metric_python":
+        return "group"
+    if kind == "user_defined_metric_python":
+        return "trace"
+    return None
+
+
+def _sql_literal(value: Any) -> str:
+    text = str(value).strip()
+    if re.fullmatch(r"-?\d+(?:\.\d+)?", text):
+        return text
+    return "'" + text.replace("'", "''") + "'"
+
+
+def _sql_field(filter_item: dict[str, Any]) -> str | None:
+    field = str(filter_item.get("field") or "").strip()
+    key = str(filter_item.get("key") or "").strip()
+    if field in {"metadata", "metadata_field"}:
+        return f"metadata.{key}" if key else "metadata"
+    if field in {"feedback_scores", "feedback_score", "scores"}:
+        return f"scores.{key}" if key else None
+    mapped = _FILTER_FIELDS.get(field)
+    if mapped:
+        return mapped
+    if field.startswith(("metadata.", "span_attributes.", "scores.", "metrics.")):
+        return field
+    return None
+
+
+def filters_to_sql(filters: Any) -> tuple[str | None, str | None]:
+    """Compile Opik structured filters to a Braintrust online-scoring SQL clause."""
+    clauses = []
+    for item in filters or []:
+        raw = as_dict(item)
+        field = _sql_field(raw)
+        operator = str(raw.get("operator") or "=").strip()
+        value = raw.get("value")
+        if field is None:
+            return None, f"filter field {raw.get('field')!r} is not translated"
+        if operator in {"is_empty", "is_not_empty"}:
+            clauses.append(f"{field} IS NULL" if operator == "is_empty" else f"{field} IS NOT NULL")
+            continue
+        if value is None:
+            return None, f"filter {field} {operator} has no value"
+        if operator == "=":
+            clauses.append(f"{field} = {_sql_literal(value)}")
+        elif operator == "!=":
+            clauses.append(f"{field} IS NOT {_sql_literal(value)}")
+        elif operator in {">", ">=", "<", "<="}:
+            clauses.append(f"{field} {operator} {_sql_literal(value)}")
+        elif operator == "contains" and field == "tags":
+            clauses.append(f"tags IN ({_sql_literal(value)})")
+        elif operator == "contains":
+            clauses.append(f"{field} MATCH {_sql_literal(value)}")
+        elif operator == "starts_with":
+            clauses.append(f"{field} LIKE {_sql_literal(f'{value}%')}")
+        elif operator == "ends_with":
+            clauses.append(f"{field} LIKE {_sql_literal(f'%{value}')}")
+        elif operator == "in":
+            values = [part.strip() for part in str(value).split(",") if part.strip()]
+            if not values:
+                return None, f"filter {field} in has no values"
+            joined = ", ".join(_sql_literal(part) for part in values)
+            clauses.append(f"{field} IN ({joined})")
+        else:
+            return None, f"filter operator {operator!r} is not translated"
+    return " AND ".join(clauses) or None, None
+
+
+def _rewrite_variable_path(path: str) -> str | None:
+    parts = [part.strip() for part in path.strip().split(".") if part.strip()]
+    if not parts:
+        return None
+    root = _VARIABLE_ROOTS.get(parts[0])
+    if root is None:
+        return None
+    return ".".join([root, *parts[1:]])
+
+
+def rewrite_judge_template(text: str, variables: dict[str, str] | None) -> str:
+    aliases = {str(name): str(path) for name, path in (variables or {}).items()}
+
+    def replace(match: re.Match[str]) -> str:
+        original = match.group(1).strip()
+        path = aliases.get(original, original)
+        rewritten = _rewrite_variable_path(path)
+        if rewritten is None:
+            return match.group(0)
+        return "{{" + rewritten + "}}"
+
+    return _MUSTACHE.sub(replace, text)
+
+
+def _message_text(message: dict[str, Any]) -> str | None:
+    content = message.get("content")
+    if isinstance(content, str) and content.strip():
+        return content
+    for part in message.get("content_array") or []:
+        part = as_dict(part)
+        if part.get("image_url") or part.get("video_url") or part.get("audio_url"):
+            return None
+        text = part.get("text")
+        if isinstance(text, str) and text.strip():
+            return text
+    return None
+
+
+def _judge_messages(code: dict[str, Any]) -> tuple[list[dict[str, str]] | None, str | None]:
+    messages = []
+    variables = {
+        str(name): str(path) for name, path in as_dict(code.get("variables") or {}).items() if path
+    }
+    for item in code.get("messages") or []:
+        raw = as_dict(item)
+        if raw.get("image_url") or raw.get("video_url") or raw.get("audio_url"):
+            return None, "multimodal judge messages are not translated"
+        for part in raw.get("content_array") or []:
+            if as_dict(part).get("image_url") or as_dict(part).get("video_url"):
+                return None, "multimodal judge messages are not translated"
+        text = _message_text(raw)
+        if text is None:
+            continue
+        role = _MESSAGE_ROLES.get(str(raw.get("role") or "user").lower())
+        if role is None:
+            return None, f"judge message role {raw.get('role')!r} is not translated"
+        messages.append({"role": role, "content": rewrite_judge_template(text, variables)})
+    if not messages:
+        return None, "LLM-as-judge rule has no text messages"
+    return messages, None
+
+
+def _choice_scores(schema: dict[str, Any]) -> tuple[dict[str, float], str] | tuple[None, str]:
+    kind = str(schema.get("type") or "").upper()
+    name = str(schema.get("name") or "score")
+    description = str(schema.get("description") or "").strip()
+    if kind == "BOOLEAN":
+        instruction = f"For {name}, answer with true or false."
+        if description:
+            instruction = f"{description.rstrip('.')}. {instruction}"
+        return {"true": 1.0, "false": 0.0}, instruction
+    if kind in {"DOUBLE", "INTEGER"}:
+        instruction = (
+            f"For {name}, return only one of: "
+            + ", ".join(str(choice) for choice in NUMERIC_CHOICES)
+            + "."
+        )
+        if description:
+            instruction = f"{description.rstrip('.')}. {instruction}"
+        return {str(choice): float(choice) for choice in NUMERIC_CHOICES}, instruction
+    return None, f"score schema type {kind or 'missing'!r} is not translated"
+
+
+def _model_options(model: Any) -> dict[str, Any]:
+    raw = as_dict(model) if model and not isinstance(model, str) else {"name": model}
+    options: dict[str, Any] = {}
+    if name := raw.get("name") or raw.get("model"):
+        options["model"] = str(name)
+    params = compact(
+        {
+            "temperature": _number(raw.get("temperature")),
+            "seed": raw.get("seed"),
+        }
+    )
+    if params:
+        options["params"] = params
+    return options
+
+
+def sampling_rate(evaluator: Any) -> float:
+    raw = as_dict(evaluator)
+    rate = _number(raw.get("sampling_rate"))
+    if rate is None:
+        return 1.0
+    if rate > 1:
+        rate = rate / 100
+    return min(1.0, max(0.0, rate))
+
+
+def scorer_definitions(evaluator: Any) -> tuple[list[dict[str, Any]], str | None]:
+    """Map an Opik evaluator into Braintrust LLM-as-judge scorer functions."""
+    raw = jsonable(as_dict(evaluator))
+    kind = evaluator_type(raw)
+    if kind in PYTHON_METRIC_TYPES:
+        return [], "custom Python metrics are not auto-translated"
+    if kind not in LLM_JUDGE_SCOPES:
+        return [], f"evaluator type {kind or 'missing'!r} is not translated"
+    code = as_dict(raw.get("code"))
+    messages, message_error = _judge_messages(code)
+    if message_error:
+        return [], message_error
+    schema_fields = [as_dict(item) for item in code.get("schema") or code.get("schema_") or []]
+    if not schema_fields:
+        schema_fields = [{"name": "score", "type": "BOOLEAN", "description": ""}]
+    definitions = []
+    rule_name = str(raw.get("name") or "Opik scorer")
+    source_id_value = str(raw.get("id") or rule_name)
+    for field in schema_fields:
+        scores, instruction = _choice_scores(field)
+        if scores is None:
+            return [], instruction
+        field_name = str(field.get("name") or "score")
+        name = rule_name if len(schema_fields) == 1 else f"{rule_name} · {field_name}"
+        field_id = source_id_value if len(schema_fields) == 1 else f"{source_id_value}:{field_name}"
+        prompt_messages = list(messages or [])
+        prompt_messages.append({"role": "user", "content": instruction})
+        prompt_data = {
+            "prompt": {"type": "chat", "messages": prompt_messages},
+            "template_format": "mustache",
+            "parser": {
+                "type": "llm_classifier",
+                "use_cot": True,
+                "choice_scores": scores,
+            },
+        }
+        if options := _model_options(code.get("model")):
+            prompt_data["options"] = options
+        definitions.append(
+            {
+                "name": name,
+                "slug": scorer_slug(name, field_id),
+                "description": raw.get("description"),
+                "function_type": "scorer",
+                "function_data": {"type": "prompt"},
+                "prompt_data": prompt_data,
+                "tags": ["opik"],
+            }
+        )
+    return definitions, None
+
+
+def online_score_payload(
+    evaluator: Any,
+    function_ids: list[str],
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Build a Braintrust online project_score that binds already-migrated scorers."""
+    raw = jsonable(as_dict(evaluator))
+    if not function_ids:
+        return None, "no translated scorers to attach"
+    if raw.get("enabled") is False:
+        return None, "rule is disabled"
+    trigger = str(raw.get("trigger_scope") or "production").lower()
+    if trigger == "experiment":
+        return None, "online scoring is not attached for experiment-only rules"
+    scope_type = evaluator_scope(raw)
+    if scope_type is None:
+        return None, f"evaluator type {evaluator_type(raw)!r} is not translated"
+    sql, sql_error = filters_to_sql(raw.get("filters"))
+    if sql_error:
+        return None, sql_error
+    if scope_type == "span":
+        scope: dict[str, Any] = {"type": "span"}
+    elif scope_type == "group":
+        scope = {
+            "type": "group",
+            "group_by": "metadata.thread_id",
+            "placement": "each",
+            "idle_seconds": THREAD_IDLE_SECONDS,
+        }
+    else:
+        scope = {"type": "trace", "idle_seconds": 30}
+    return compact(
+        {
+            "name": str(raw.get("name") or "Opik online eval"),
+            "description": raw.get("description"),
+            "score_type": "online",
+            "config": {
+                "online": compact(
+                    {
+                        "sampling_rate": sampling_rate(raw),
+                        "scorers": [
+                            {"type": "function", "id": function_id} for function_id in function_ids
+                        ],
+                        "btql_filter": sql,
+                        "scope": scope,
+                    }
+                )
+            },
+        }
+    ), None
+
+
+REVIEW_FLAG_LIST = "__bt_default_review_list"
+
+
+def _feedback_details(raw: dict[str, Any]) -> dict[str, Any]:
+    return as_dict(raw.get("details") or raw.get("details_") or {})
+
+
+def _rescale_category_values(categories: dict[str, float]) -> dict[str, float]:
+    values = list(categories.values())
+    if not values:
+        return categories
+    low, high = min(values), max(values)
+    if low >= 0 and high <= 1:
+        return categories
+    if high == low:
+        return {name: 1.0 for name in categories}
+    return {name: (value - low) / (high - low) for name, value in categories.items()}
+
+
+def review_score_payload(definition: Any) -> tuple[dict[str, Any] | None, str | None]:
+    """Map an Opik feedback definition onto a Braintrust human-review project score."""
+    raw = jsonable(as_dict(definition))
+    name = str(raw.get("name") or "").strip()
+    if not name:
+        return None, "feedback definition has no name"
+    kind = str(raw.get("type") or "").lower()
+    details = jsonable(_feedback_details(raw))
+    description_parts = [text for text in [raw.get("description")] if text]
+    if kind == "numerical":
+        low = _number(details.get("min"))
+        high = _number(details.get("max"))
+        if low is None or high is None:
+            return None, "numerical definition is missing min/max"
+        if high < low:
+            return None, "numerical definition has max below min"
+        if low != 0 or high != 1:
+            description_parts.append(
+                f"Opik range was {low:g}-{high:g}. Braintrust review sliders are 0-1; "
+                "historical values outside [0, 1] were stored as metrics."
+            )
+        return {
+            "name": name,
+            "description": " ".join(description_parts) or None,
+            "score_type": "slider",
+        }, None
+    if kind == "categorical":
+        raw_categories = details.get("categories") or {}
+        if not isinstance(raw_categories, dict) or not raw_categories:
+            return None, "categorical definition has no categories"
+        numeric = {
+            str(label): value
+            for label, raw_value in raw_categories.items()
+            if (value := _number(raw_value)) is not None
+        }
+        if not numeric:
+            return None, "categorical definition has no numeric values"
+        scaled = _rescale_category_values(numeric)
+        if scaled != numeric:
+            description_parts.append(
+                "Opik category values were rescaled into Braintrust's 0-1 range."
+            )
+        return {
+            "name": name,
+            "description": " ".join(description_parts) or None,
+            "score_type": "categorical",
+            "categories": [{"name": label, "value": value} for label, value in scaled.items()],
+        }, None
+    if kind == "boolean":
+        true_label = (
+            str(details.get("true_label") or details.get("trueLabel") or "true").strip() or "true"
+        )
+        false_label = (
+            str(details.get("false_label") or details.get("falseLabel") or "false").strip()
+            or "false"
+        )
+        return {
+            "name": name,
+            "description": " ".join(description_parts) or None,
+            "score_type": "categorical",
+            "categories": [
+                {"name": true_label, "value": 1.0},
+                {"name": false_label, "value": 0.0},
+            ],
+        }, None
+    return None, f"feedback definition type {kind or 'missing'!r} is not translated"
+
+
+def queue_reviewer_notes(queue: Any) -> str:
+    raw = jsonable(as_dict(queue))
+    notes = []
+    if instructions := str(raw.get("instructions") or "").strip():
+        notes.append(instructions)
+    extras = []
+    if raw.get("scope"):
+        extras.append(f"Opik scope: {raw['scope']}")
+    if raw.get("comments_enabled") is not None:
+        extras.append(f"comments_enabled={raw['comments_enabled']}")
+    if raw.get("annotators_per_item") is not None:
+        extras.append(f"annotators_per_item={raw['annotators_per_item']} (not enforced)")
+    if raw.get("lock_timeout_seconds") is not None:
+        extras.append(f"lock_timeout_seconds={raw['lock_timeout_seconds']} (not enforced)")
+    if extras:
+        notes.append("Unmapped Opik queue fields: " + "; ".join(extras) + ".")
+    return "\n\n".join(notes)
+
+
+def review_view_payload(queue: Any) -> dict[str, Any]:
+    """Build a Braintrust Review view for an Opik annotation queue."""
+    raw = jsonable(as_dict(queue))
+    queue_id = str(raw.get("id") or raw.get("name") or "queue")
+    options: dict[str, Any] = {"layout": "kanban"}
+    if str(raw.get("scope") or "").lower() == "thread":
+        options["grouping"] = "metadata.thread_id"
+    return {
+        "name": str(raw.get("name") or "Opik annotation queue"),
+        "object_type": "project",
+        "view_type": "for_review_project_log",
+        "view_data": {
+            "search": {
+                "filter": [f"metadata.opik_annotation_queue_id = '{queue_id}'"],
+            }
+        },
+        "options": options,
+    }
+
+
+def review_flag_event(trace_id: str, queue: Any) -> dict[str, Any]:
+    """Merge a pending-review flag onto an already migrated Braintrust root span."""
+    raw = jsonable(as_dict(queue))
+    return {
+        "id": source_id("trace", trace_id),
+        "metadata": {
+            "~__bt_review_lists": {REVIEW_FLAG_LIST: {"status": "PENDING"}},
+            "opik_annotation_queue": raw.get("name"),
+            "opik_annotation_queue_id": raw.get("id"),
+        },
+        "_is_merge": True,
+        "_merge_paths": [
+            ["metadata", "~__bt_review_lists"],
+            ["metadata", "opik_annotation_queue"],
+            ["metadata", "opik_annotation_queue_id"],
+        ],
+    }
+
+
+ROOT_SPAN_FILTER = "is_root"
+THREAD_SPAN_FILTER = "metadata.thread_id IS NOT NULL"
+LLM_SPAN_FILTER = "span_attributes.type = 'llm'"
+ERROR_SPAN_FILTER = "error IS NOT NULL"
+_DURATION_PERCENTILES = {"p50": 0.5, "p90": 0.9, "p99": 0.99}
+_BREAKDOWN_FIELDS = {
+    "tags": "tags",
+    "name": "span_attributes.name",
+    "error_info": "error",
+    "error_type": "error",
+    "model": "metadata.opik.model",
+    "provider": "metadata.opik.provider",
+    "type": "span_attributes.type",
+    "guardrail_name": "span_attributes.name",
+}
+_USAGE_MEASURES = {
+    "total_tokens": "metrics.tokens",
+    "prompt_tokens": "metrics.prompt_tokens",
+    "completion_tokens": "metrics.completion_tokens",
+    "usage.total_tokens": "metrics.tokens",
+    "usage.prompt_tokens": "metrics.prompt_tokens",
+    "usage.completion_tokens": "metrics.completion_tokens",
+}
+
+
+def _cfg(config: dict[str, Any], snake: str, default: Any = None) -> Any:
+    parts = snake.split("_")
+    camel = parts[0] + "".join(part.title() for part in parts[1:])
+    if snake in config and config[snake] is not None:
+        return config[snake]
+    if camel in config and config[camel] is not None:
+        return config[camel]
+    return default
+
+
+def _and_sql(*parts: str | None) -> str | None:
+    clauses = [part for part in parts if part]
+    return " AND ".join(clauses) or None
+
+
+def _score_measure(name: str) -> str:
+    trimmed = name.strip()
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", trimmed):
+        return f"avg(scores.{trimmed})"
+    escaped = trimmed.replace("`", "``")
+    return f"avg(scores.`{escaped}`)"
+
+
+def _percentile_measures(values: Any) -> list[str]:
+    measures = []
+    for item in values or []:
+        token = str(item).strip().lower().removeprefix("duration.")
+        if token in {"avg", "average", "mean"}:
+            measures.append("avg(metrics.duration)")
+            continue
+        percentile = _DURATION_PERCENTILES.get(token)
+        if percentile is None:
+            continue
+        measures.append(f"percentile(metrics.duration, {percentile})")
+    return measures or [
+        "percentile(metrics.duration, 0.5)",
+        "percentile(metrics.duration, 0.9)",
+        "percentile(metrics.duration, 0.99)",
+    ]
+
+
+def _usage_measures(values: Any, *, aggregator: str = "sum") -> list[str]:
+    measures = []
+    for item in values or []:
+        field = _USAGE_MEASURES.get(str(item).strip().lower())
+        if field:
+            measures.append(f"{aggregator}({field})")
+    return measures or [f"{aggregator}(metrics.tokens)"]
+
+
+def _dashboard_config(dashboard: Any) -> dict[str, Any]:
+    raw = jsonable(as_dict(dashboard))
+    config = raw.get("config")
+    if isinstance(config, dict):
+        return config
+    return {}
+
+
+def dashboard_widgets(dashboard: Any) -> list[dict[str, Any]]:
+    config = _dashboard_config(dashboard)
+    widgets = []
+    for section in config.get("sections") or []:
+        widgets.extend(as_dict(section).get("widgets") or [])
+    if not widgets:
+        widgets.extend(config.get("widgets") or [])
+    return [jsonable(as_dict(widget)) for widget in widgets]
+
+
+def _widget_title(widget: dict[str, Any]) -> str:
+    title = (
+        widget.get("title") or widget.get("generatedTitle") or widget.get("generated_title") or ""
+    )
+    return str(title).strip() or "Untitled widget"
+
+
+def _widget_chart(
+    widget: dict[str, Any],
+    *,
+    chart_type: str,
+    measures: list[str],
+    visualization: str | None = None,
+    unit: str | None = None,
+    span_filter: str | None = None,
+    trace_filter: str | None = None,
+    group_by: str | None = None,
+) -> dict[str, Any]:
+    chart_id = str(widget.get("id") or _widget_title(widget))
+    return compact(
+        {
+            "id": chart_id,
+            "title": _widget_title(widget),
+            "chartType": chart_type,
+            "visualization": visualization,
+            "unit": unit,
+            "measures": measures,
+            "spanFilter": span_filter,
+            "traceFilter": trace_filter,
+            "groupBy": group_by,
+        }
+    )
+
+
+def _compile_widget_filters(
+    config: dict[str, Any], extra_span: str | None = None
+) -> tuple[str | None, str | None, str | None]:
+    span_sql, span_error = filters_to_sql(_cfg(config, "span_filters"))
+    if span_error:
+        return None, None, span_error
+    thread_sql, thread_error = filters_to_sql(_cfg(config, "thread_filters"))
+    if thread_error:
+        return None, None, thread_error
+    trace_sql, trace_error = filters_to_sql(_cfg(config, "trace_filters"))
+    if trace_error:
+        return None, None, trace_error
+    return _and_sql(span_sql, thread_sql, extra_span), trace_sql, None
+
+
+def _breakdown_group(config: dict[str, Any]) -> tuple[str | None, str | None]:
+    breakdown = _cfg(config, "breakdown")
+    if not isinstance(breakdown, dict):
+        return None, None
+    field = str(breakdown.get("field") or "").strip().lower()
+    if not field or field == "none":
+        return None, None
+    if field == "metadata":
+        key = str(breakdown.get("metadataKey") or breakdown.get("metadata_key") or "").strip()
+        if not key:
+            return None, "metadata breakdown has no key"
+        return f"metadata.{key}", None
+    mapped = _BREAKDOWN_FIELDS.get(field)
+    if mapped is None:
+        return None, f"breakdown field {field!r} is not translated"
+    return mapped, None
+
+
+def _translate_project_metrics(
+    widget: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str]:
+    config = as_dict(widget.get("config") or {})
+    metric = str(_cfg(config, "metric_type") or "TRACE_COUNT").strip().upper()
+    chart_kind = str(_cfg(config, "chart_type") or "line").strip().lower()
+    if chart_kind == "radar":
+        return None, "skipped — radar charts have no Monitor equivalent"
+    visualization = "bar" if chart_kind == "bar" else "line"
+    extra_span = None
+    unit = "count"
+    measures: list[str] = []
+    if metric == "TRACE_COUNT":
+        extra_span = ROOT_SPAN_FILTER
+        measures = ["count(id)"]
+    elif metric == "SPAN_COUNT":
+        measures = ["count(id)"]
+    elif metric == "THREAD_COUNT":
+        extra_span = THREAD_SPAN_FILTER
+        measures = ["count_distinct(metadata.thread_id)"]
+    elif metric in {"DURATION", "TRACE_DURATION", "SPAN_DURATION", "THREAD_DURATION"}:
+        extra_span = {
+            "DURATION": ROOT_SPAN_FILTER,
+            "TRACE_DURATION": ROOT_SPAN_FILTER,
+            "THREAD_DURATION": THREAD_SPAN_FILTER,
+        }.get(metric)
+        measures = _percentile_measures(_cfg(config, "duration_metrics"))
+        unit = "duration"
+    elif metric in {
+        "TRACE_AVERAGE_DURATION",
+        "SPAN_AVERAGE_DURATION",
+        "THREAD_AVERAGE_DURATION",
+    }:
+        extra_span = {
+            "TRACE_AVERAGE_DURATION": ROOT_SPAN_FILTER,
+            "THREAD_AVERAGE_DURATION": THREAD_SPAN_FILTER,
+        }.get(metric)
+        measures = ["avg(metrics.duration)"]
+        unit = "duration"
+    elif metric in {"TOKEN_USAGE", "SPAN_TOKEN_USAGE"}:
+        extra_span = ROOT_SPAN_FILTER if metric == "TOKEN_USAGE" else None
+        measures = _usage_measures(_cfg(config, "usage_metrics"))
+    elif metric == "COST":
+        extra_span = ROOT_SPAN_FILTER
+        measures = ["sum(metrics.estimated_cost)"]
+        unit = "cost"
+    elif metric in {"FEEDBACK_SCORES", "THREAD_FEEDBACK_SCORES", "SPAN_FEEDBACK_SCORES"}:
+        extra_span = {
+            "FEEDBACK_SCORES": ROOT_SPAN_FILTER,
+            "THREAD_FEEDBACK_SCORES": THREAD_SPAN_FILTER,
+        }.get(metric)
+        names = [
+            str(name).strip()
+            for name in (_cfg(config, "feedback_scores") or [])
+            if str(name).strip()
+        ]
+        if not names:
+            return None, "skipped — feedback-score widget has no score names"
+        measures = [_score_measure(name) for name in names]
+    elif metric in {"TRACE_ERROR_RATE", "SPAN_ERROR_RATE"}:
+        extra_span = ROOT_SPAN_FILTER if metric == "TRACE_ERROR_RATE" else None
+        measures = ["sum(metrics.errors) / count(id)"]
+        unit = "percent"
+    elif metric == "GUARDRAILS_FAILED_COUNT":
+        return None, "skipped — guardrail-failed count has no dedicated Monitor metric"
+    else:
+        return None, f"skipped — metric {metric!r} is not translated"
+    span_filter, trace_filter, error = _compile_widget_filters(config, extra_span)
+    if error:
+        return None, f"skipped — {error}"
+    group_by, group_error = _breakdown_group(config)
+    if group_error:
+        return None, f"skipped — {group_error}"
+    chart = _widget_chart(
+        widget,
+        chart_type="timeseries",
+        measures=measures,
+        visualization=visualization,
+        unit=unit,
+        span_filter=span_filter,
+        trace_filter=trace_filter,
+        group_by=group_by,
+    )
+    return chart, f"timeseries {' '.join(measures)}"
+
+
+def _translate_stats_card(widget: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+    config = as_dict(widget.get("config") or {})
+    metric = str(_cfg(config, "metric") or "trace_count").strip()
+    source = str(_cfg(config, "source") or "traces").strip().lower()
+    extra_span = ROOT_SPAN_FILTER if source != "spans" else None
+    unit = "count"
+    measures: list[str]
+    lowered = metric.lower()
+    if lowered in {"trace_count"}:
+        extra_span = ROOT_SPAN_FILTER
+        measures = ["count(id)"]
+    elif lowered == "thread_count":
+        extra_span = THREAD_SPAN_FILTER
+        measures = ["count_distinct(metadata.thread_id)"]
+    elif lowered == "span_count" and source == "spans":
+        extra_span = None
+        measures = ["count(id)"]
+    elif lowered == "llm_span_count":
+        extra_span = LLM_SPAN_FILTER
+        measures = ["count(id)"]
+    elif lowered in {"duration.p50", "duration.p90", "duration.p99"}:
+        measures = _percentile_measures([lowered])
+        unit = "duration"
+    elif lowered == "total_estimated_cost_sum":
+        measures = ["sum(metrics.estimated_cost)"]
+        unit = "cost"
+    elif lowered == "total_estimated_cost":
+        measures = ["avg(metrics.estimated_cost)"]
+        unit = "cost"
+    elif lowered in _USAGE_MEASURES:
+        measures = [f"avg({_USAGE_MEASURES[lowered]})"]
+    elif lowered == "error_count":
+        extra_span = _and_sql(extra_span, ERROR_SPAN_FILTER)
+        measures = ["count(id)"]
+    elif lowered.startswith("feedback_scores."):
+        name = metric.split(".", 1)[1].strip()
+        if not name:
+            return None, "skipped — feedback-score card has no score name"
+        measures = [_score_measure(name)]
+    elif lowered == "guardrails_failed_count":
+        return None, "skipped — guardrail-failed count has no dedicated Monitor metric"
+    elif lowered in {"input", "output", "metadata", "tags", "span_count"}:
+        return None, f"skipped — stat card metric {metric!r} is not a Monitor chart"
+    else:
+        return None, f"skipped — stat card metric {metric!r} is not translated"
+    span_filter, trace_filter, error = _compile_widget_filters(config, extra_span)
+    if error:
+        return None, f"skipped — {error}"
+    chart = _widget_chart(
+        widget,
+        chart_type="bignumber",
+        measures=measures,
+        unit=unit,
+        span_filter=span_filter,
+        trace_filter=trace_filter,
+    )
+    return chart, f"bignumber {' '.join(measures)}"
+
+
+def _translate_widget(widget: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+    kind = str(widget.get("type") or "").strip().lower()
+    title = _widget_title(widget)
+    if kind == "project_metrics":
+        chart, note = _translate_project_metrics(widget)
+    elif kind == "project_stats_card":
+        chart, note = _translate_stats_card(widget)
+    elif kind == "text_markdown":
+        chart, note = None, "skipped — markdown is not a Monitor chart"
+    elif kind in {"experiments_feedback_scores", "experiment_leaderboard"}:
+        chart, note = None, f"skipped — {kind.replace('_', ' ')} has no Monitor equivalent"
+    elif not kind:
+        chart, note = None, "skipped — widget has no type"
+    else:
+        chart, note = None, f"skipped — widget type {kind!r} is not translated"
+    return chart, f"{title}: {note}"
+
+
+def dashboard_view_payload(
+    dashboard: Any,
+) -> tuple[dict[str, Any] | None, str | None, list[str]]:
+    """Build a Braintrust Monitor view for an Opik production dashboard."""
+    raw = jsonable(as_dict(dashboard))
+    notes = []
+    charts = []
+    for widget in dashboard_widgets(dashboard):
+        chart, note = _translate_widget(widget)
+        notes.append(note)
+        if chart is not None:
+            charts.append(chart)
+    kind = str(raw.get("type") or "multi_project").strip().lower()
+    scope = str(raw.get("scope") or "workspace").strip().lower()
+    if scope == "insights":
+        return None, "built-in Insights dashboards are not migrated", notes
+    if kind == "experiments":
+        return (
+            None,
+            "experiment dashboards are inventoried, not written as Monitor views",
+            notes,
+        )
+    if kind and kind != "multi_project":
+        return None, f"dashboard type {kind!r} is not translated", notes
+    if not charts:
+        return None, "no translatable production widgets", notes
+    return (
+        {
+            "name": str(raw.get("name") or "Opik dashboard"),
+            "object_type": "project",
+            "view_type": "monitor",
+            "view_data": {"custom_charts": charts},
+            "options": {
+                "viewType": "monitor",
+                "options": {"type": "project", "spanType": "range", "rangeValue": "7d"},
+            },
+        },
+        None,
+        notes,
+    )

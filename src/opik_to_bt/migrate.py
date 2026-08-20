@@ -9,10 +9,19 @@ from typing import Any
 from opik_to_bt.checkpoint import Checkpoint
 from opik_to_bt.config import PromptHistory, Resource, parse_datetime
 from opik_to_bt.mapping import (
+    dashboard_view_payload,
     dataset_event,
+    evaluator_scope,
+    evaluator_type,
     experiment_events,
+    online_score_payload,
     prompt_definition,
     prompt_slug,
+    queue_reviewer_notes,
+    review_flag_event,
+    review_score_payload,
+    review_view_payload,
+    scorer_definitions,
     span_event,
     trace_event,
 )
@@ -32,6 +41,11 @@ class Selection:
     end: datetime | None
     prompts: set[str] | None = None
     prompt_history: PromptHistory = PromptHistory.LATEST
+    scorers: set[str] | None = None
+    online_evals: set[str] | None = None
+    review_scores: set[str] | None = None
+    annotation_queues: set[str] | None = None
+    dashboards: set[str] | None = None
     dry_run: bool = False
 
 
@@ -115,6 +129,25 @@ class Migrator:
             if missing:
                 raise RuntimeError(f"Opik projects not found: {', '.join(sorted(missing))}")
         self.progress.message(f"Selected {len(projects)} project(s)")
+        if Resource.ONLINE_EVALS in selection.resources:
+            self.progress.message(
+                "Warning: online scoring will score new production logs in Braintrust. "
+                "Already migrated traces are not re-scored. Omit online-evals to copy "
+                "scorer definitions without attaching live scoring."
+            )
+        if Resource.ANNOTATION_QUEUES in selection.resources:
+            self.progress.message(
+                "Warning: annotation queues flag current backlog items as unassigned "
+                "Awaiting review in Braintrust. Reviewers are not auto-assigned. "
+                "Omit annotation-queues to copy review-score widgets without the backlog."
+            )
+        if Resource.DASHBOARDS in selection.resources:
+            self.progress.message(
+                "Monitor views are written with generated custom charts. Custom "
+                "charts require a Braintrust Pro or Enterprise plan. Experiment "
+                "dashboards, radar charts, markdown, and Insights overviews are "
+                "inventoried and skipped."
+            )
         if selection.dry_run:
             await self._inventory(projects, selection)
             return
@@ -151,11 +184,21 @@ class Migrator:
             )
         if Resource.PROMPTS in selection.resources:
             independent.append(self._prompts(source_project_id, target_project_id, selection))
+        if Resource.SCORERS in selection.resources:
+            independent.append(self._scorers(source_project_id, target_project_id, selection))
+        if Resource.REVIEW_SCORES in selection.resources:
+            independent.append(self._review_scores(source_project_id, target_project_id, selection))
         if independent:
             await asyncio.gather(*independent)
         # Keep related datasets available before their experiment results.
         if Resource.EXPERIMENTS in selection.resources:
             await self._experiments(source_project_id, target_project_id, selection)
+        if Resource.ONLINE_EVALS in selection.resources:
+            await self._online_evals(source_project_id, target_project_id, selection)
+        if Resource.ANNOTATION_QUEUES in selection.resources:
+            await self._annotation_queues(source_project_id, target_project_id, selection)
+        if Resource.DASHBOARDS in selection.resources:
+            await self._dashboards(source_project_id, target_project_id, selection)
 
     @staticmethod
     def _prompt_version_id(version: Any) -> str:
@@ -171,6 +214,46 @@ class Migrator:
         return all(current.get(field) == definition.get(field) for field in fields) and (
             current.get("tags") or []
         ) == (definition.get("tags") or [])
+
+    @staticmethod
+    def _function_matches(current: dict[str, Any], definition: dict[str, Any]) -> bool:
+        fields = (
+            "name",
+            "slug",
+            "description",
+            "function_type",
+            "function_data",
+            "prompt_data",
+        )
+        return all(current.get(field) == definition.get(field) for field in fields) and (
+            current.get("tags") or []
+        ) == (definition.get("tags") or [])
+
+    @staticmethod
+    def _online_score_matches(current: dict[str, Any], definition: dict[str, Any]) -> bool:
+        return (
+            current.get("name") == definition.get("name")
+            and current.get("score_type") == definition.get("score_type")
+            and current.get("config") == definition.get("config")
+        )
+
+    @staticmethod
+    def _review_score_matches(current: dict[str, Any], definition: dict[str, Any]) -> bool:
+        return (
+            current.get("name") == definition.get("name")
+            and current.get("score_type") == definition.get("score_type")
+            and current.get("description") == definition.get("description")
+            and current.get("categories") == definition.get("categories")
+        )
+
+    @staticmethod
+    def _view_matches(current: dict[str, Any], definition: dict[str, Any]) -> bool:
+        fields = ("name", "view_type", "view_data")
+        if not all(current.get(field) == definition.get(field) for field in fields):
+            return False
+        if definition.get("view_type") == "monitor":
+            return True
+        return current.get("options") == definition.get("options")
 
     async def _prompts(
         self, source_project_id: str, target_project_id: str, selection: Selection
@@ -327,6 +410,325 @@ class Migrator:
 
         self.checkpoint.mark_completed(completion_key)
         self.progress.complete(task, items=len(versions), partitions=0)
+
+    async def _evaluators(self, source_project_id: str, names: set[str] | None) -> list[Any]:
+        return [
+            item
+            for item in await self.source.evaluators(source_project_id)
+            if selected(as_dict(item)["name"], names)
+        ]
+
+    async def _scorers(
+        self, source_project_id: str, target_project_id: str, selection: Selection
+    ) -> None:
+        evaluators = await self._evaluators(source_project_id, selection.scorers)
+        await bounded_gather(
+            evaluators,
+            lambda evaluator: self._resource(self._write_scorers, evaluator, target_project_id),
+            self.tuning.resource_workers,
+        )
+
+    async def _write_scorers(self, evaluator: Any, target_project_id: str) -> list[str]:
+        raw = as_dict(evaluator)
+        source_id = str(raw["id"])
+        completion_key = f"scorer:{source_id}"
+        functions_key = f"scorer:{source_id}:functions"
+        if self.checkpoint.completed(completion_key):
+            self.progress.checkpointed(f"scorer {raw['name']}")
+            stored = self.checkpoint.value(functions_key) or {}
+            return list(stored.values())
+
+        definitions, skip = scorer_definitions(evaluator)
+        if skip:
+            self.progress.message(f"  scorer {raw['name']}: skipped — {skip}")
+            self.checkpoint.set_value(functions_key, {})
+            self.checkpoint.mark_completed(completion_key)
+            return []
+
+        task = self.progress.start(f"scorer · {raw['name']}")
+        migrated = dict(self.checkpoint.value(functions_key) or {})
+        function_ids = []
+        for definition in definitions:
+            slug = str(definition["slug"])
+            if slug in migrated:
+                function_ids.append(migrated[slug])
+                continue
+            current = await self.target.get_function(target_project_id, slug)
+            if current is not None and self._function_matches(current, definition):
+                written = current
+            else:
+                written = await self.target.write_function(
+                    target_project_id,
+                    definition,
+                    update=current is not None,
+                )
+            function_id = str(written["id"])
+            migrated[slug] = function_id
+            function_ids.append(function_id)
+            self.checkpoint.set_target("scorer", f"{source_id}:{slug}", function_id)
+            self.checkpoint.set_value(functions_key, migrated)
+
+        self.checkpoint.mark_completed(completion_key)
+        self.progress.complete(task, items=len(definitions), partitions=0)
+        return function_ids
+
+    async def _online_evals(
+        self, source_project_id: str, target_project_id: str, selection: Selection
+    ) -> None:
+        evaluators = await self._evaluators(source_project_id, selection.online_evals)
+        await bounded_gather(
+            evaluators,
+            lambda evaluator: self._resource(self._online_eval, evaluator, target_project_id),
+            self.tuning.resource_workers,
+        )
+
+    async def _online_eval(self, evaluator: Any, target_project_id: str) -> None:
+        raw = as_dict(evaluator)
+        source_id = str(raw["id"])
+        completion_key = f"online-eval:{source_id}"
+        if self.checkpoint.completed(completion_key):
+            self.progress.checkpointed(f"online eval {raw['name']}")
+            return
+
+        function_ids = await self._write_scorers(evaluator, target_project_id)
+        payload, skip = online_score_payload(evaluator, function_ids)
+        if skip:
+            self.progress.message(f"  online eval {raw['name']}: skipped — {skip}")
+            self.checkpoint.mark_completed(completion_key)
+            return
+
+        task = self.progress.start(f"online eval · {raw['name']}")
+        current = await self.target.get_project_score(target_project_id, payload["name"])
+        if current is not None and self._online_score_matches(current, payload):
+            written = current
+        else:
+            written = await self.target.write_project_score(
+                target_project_id,
+                payload,
+                update=current is not None,
+            )
+        self.checkpoint.set_target("online-eval", source_id, str(written["id"]))
+        self.checkpoint.mark_completed(completion_key)
+        self.progress.complete(task, items=1, partitions=0)
+
+    async def _all_feedback_definitions(self) -> list[Any]:
+        cached = getattr(self, "_cached_feedback_definitions", None)
+        if cached is None:
+            self._cached_feedback_definitions = await self.source.feedback_definitions()
+            cached = self._cached_feedback_definitions
+        return cached
+
+    async def _review_scores(
+        self, source_project_id: str, target_project_id: str, selection: Selection
+    ) -> None:
+        definitions = [
+            item
+            for item in await self._all_feedback_definitions()
+            if selected(as_dict(item)["name"], selection.review_scores)
+        ]
+        await bounded_gather(
+            definitions,
+            lambda definition: self._resource(
+                self._write_review_score, definition, source_project_id, target_project_id
+            ),
+            self.tuning.resource_workers,
+        )
+
+    async def _write_review_score(
+        self, definition: Any, source_project_id: str, target_project_id: str
+    ) -> str | None:
+        raw = as_dict(definition)
+        source_id = str(raw.get("id") or raw["name"])
+        completion_key = f"review-score:{source_project_id}:{source_id}"
+        if self.checkpoint.completed(completion_key):
+            self.progress.checkpointed(f"review score {raw['name']}")
+            return self.checkpoint.target("review-score", f"{source_project_id}:{source_id}")
+
+        payload, skip = review_score_payload(definition)
+        if skip:
+            self.progress.message(f"  review score {raw['name']}: skipped — {skip}")
+            self.checkpoint.mark_completed(completion_key)
+            return None
+
+        task = self.progress.start(f"review score · {raw['name']}")
+        current = await self.target.get_project_score(target_project_id, payload["name"])
+        if current is not None and current.get("score_type") == "online":
+            self.progress.message(
+                f"  review score {raw['name']}: skipped — a Braintrust online score "
+                "already uses this name"
+            )
+            self.checkpoint.mark_completed(completion_key)
+            self.progress.complete(task, items=0, partitions=0)
+            return None
+        if current is not None and self._review_score_matches(current, payload):
+            written = current
+        else:
+            written = await self.target.write_project_score(
+                target_project_id,
+                payload,
+                update=current is not None,
+            )
+        score_id = str(written["id"])
+        self.checkpoint.set_target("review-score", f"{source_project_id}:{source_id}", score_id)
+        self.checkpoint.mark_completed(completion_key)
+        self.progress.complete(task, items=1, partitions=0)
+        return score_id
+
+    async def _annotation_queues(
+        self, source_project_id: str, target_project_id: str, selection: Selection
+    ) -> None:
+        queues = [
+            item
+            for item in await self.source.annotation_queues(source_project_id)
+            if selected(as_dict(item)["name"], selection.annotation_queues)
+        ]
+        if Resource.REVIEW_SCORES not in selection.resources:
+            await self._review_scores(source_project_id, target_project_id, selection)
+        await bounded_gather(
+            queues,
+            lambda queue: self._resource(
+                self._annotation_queue, queue, source_project_id, target_project_id
+            ),
+            self.tuning.resource_workers,
+        )
+
+    async def _annotation_queue(
+        self, queue: Any, source_project_id: str, target_project_id: str
+    ) -> None:
+        raw = as_dict(queue)
+        source_id = str(raw["id"])
+        completion_key = f"annotation-queue:{source_id}"
+        if self.checkpoint.completed(completion_key):
+            self.progress.checkpointed(f"annotation queue {raw['name']}")
+            return
+
+        if notes := queue_reviewer_notes(queue):
+            self.progress.message(f"  annotation queue {raw['name']}: {notes.splitlines()[0]}")
+
+        payload = review_view_payload(queue)
+        current = await self.target.get_view(
+            target_project_id, payload["name"], view_type=payload["view_type"]
+        )
+        if current is not None and self._view_matches(current, payload):
+            written = current
+        else:
+            written = await self.target.write_view(
+                target_project_id,
+                payload,
+                update=current is not None,
+            )
+        self.checkpoint.set_target("annotation-queue", source_id, str(written["id"]))
+
+        trace_ids = await self._queue_trace_ids(queue, source_project_id)
+        if trace_ids:
+            events = [review_flag_event(trace_id, queue) for trace_id in trace_ids]
+            await self.target.flag_logs_for_review(target_project_id, events)
+        elif str(raw.get("scope") or "trace").lower() == "thread":
+            self.progress.message(
+                f"  annotation queue {raw['name']}: no migrated traces found for "
+                "thread items; review view created without flags"
+            )
+        self.checkpoint.mark_completed(completion_key)
+        task = self.progress.start(f"annotation queue · {raw['name']}")
+        self.progress.complete(task, items=len(trace_ids), partitions=0)
+
+    async def _queue_trace_ids(self, queue: Any, source_project_id: str) -> list[str]:
+        raw = as_dict(queue)
+        queue_id = str(raw["id"])
+        if str(raw.get("scope") or "trace").lower() == "thread":
+            threads = await self.source.annotation_queue_threads(source_project_id, queue_id)
+            trace_ids: list[str] = []
+            seen: set[str] = set()
+            for thread in threads:
+                thread_id = as_dict(thread).get("id")
+                if not thread_id:
+                    continue
+                for trace in await self.source.traces_for_thread(source_project_id, str(thread_id)):
+                    trace_id = str(as_dict(trace)["id"])
+                    if trace_id not in seen:
+                        seen.add(trace_id)
+                        trace_ids.append(trace_id)
+            return trace_ids
+        traces = await self.source.annotation_queue_traces(source_project_id, queue_id)
+        return [str(as_dict(trace)["id"]) for trace in traces]
+
+    async def _listed_dashboards(self, source_project_id: str) -> list[Any]:
+        cached = getattr(self, "_cached_dashboards", None)
+        workspace = getattr(self, "_cached_workspace_dashboards", None)
+        if workspace is None:
+            self._cached_workspace_dashboards = await self.source.dashboards()
+            workspace = self._cached_workspace_dashboards
+        if cached is None:
+            self._cached_dashboards = {}
+            cached = self._cached_dashboards
+        if source_project_id not in cached:
+            cached[source_project_id] = await self.source.dashboards(source_project_id)
+        seen: dict[str, Any] = {}
+        for dashboard in [*workspace, *cached[source_project_id]]:
+            raw = as_dict(dashboard)
+            owner = raw.get("project_id")
+            if owner not in (None, "", source_project_id):
+                continue
+            seen[str(raw.get("id") or raw.get("name"))] = dashboard
+        return list(seen.values())
+
+    async def _dashboards(
+        self, source_project_id: str, target_project_id: str, selection: Selection
+    ) -> None:
+        dashboards = [
+            item
+            for item in await self._listed_dashboards(source_project_id)
+            if selected(as_dict(item)["name"], selection.dashboards)
+        ]
+        await bounded_gather(
+            dashboards,
+            lambda dashboard: self._resource(
+                self._dashboard, dashboard, source_project_id, target_project_id
+            ),
+            self.tuning.resource_workers,
+        )
+
+    async def _dashboard(
+        self, dashboard: Any, source_project_id: str, target_project_id: str
+    ) -> None:
+        raw = as_dict(dashboard)
+        source_id = str(raw.get("id") or raw["name"])
+        completion_key = f"dashboard:{source_project_id}:{source_id}"
+        if self.checkpoint.completed(completion_key):
+            self.progress.checkpointed(f"dashboard {raw['name']}")
+            return
+
+        payload, skip, notes = dashboard_view_payload(dashboard)
+        for note in notes:
+            if "skipped" in note:
+                self.progress.message(f"  dashboard {raw['name']}: {note}")
+        if skip:
+            self.progress.message(f"  dashboard {raw['name']}: skipped — {skip}")
+            self.checkpoint.mark_completed(completion_key)
+            return
+        assert payload is not None
+        if raw.get("project_id") in (None, ""):
+            self.progress.message(
+                f"  dashboard {raw['name']}: workspace dashboard copied into this project"
+            )
+
+        current = await self.target.get_view(
+            target_project_id, payload["name"], view_type=payload["view_type"]
+        )
+        if current is not None and self._view_matches(current, payload):
+            written = current
+        else:
+            written = await self.target.write_view(
+                target_project_id,
+                payload,
+                update=current is not None,
+            )
+        self.checkpoint.set_target(
+            "dashboard", f"{source_project_id}:{source_id}", str(written["id"])
+        )
+        self.checkpoint.mark_completed(completion_key)
+        task = self.progress.start(f"dashboard · {raw['name']}")
+        self.progress.complete(task, items=len(payload["view_data"]["custom_charts"]), partitions=0)
 
     async def _datasets(
         self, source_project_id: str, target_project_id: str, selection: Selection
@@ -582,4 +984,124 @@ class Migrator:
                 parts.append(
                     f"{len(prompts)} prompt(s), {selection.prompt_history.value} version mode"
                 )
+            extra: list[str] = []
+            details: list[str] = []
+            if (
+                Resource.SCORERS in selection.resources
+                or Resource.ONLINE_EVALS in selection.resources
+            ):
+                extra, details = await self._inventory_evaluators(raw["id"], selection)
+            if Resource.REVIEW_SCORES in selection.resources:
+                score_extra, score_details = await self._inventory_review_scores(selection)
+                extra.extend(score_extra)
+                details.extend(score_details)
+            if Resource.ANNOTATION_QUEUES in selection.resources:
+                queue_extra, queue_details = await self._inventory_annotation_queues(
+                    raw["id"], selection
+                )
+                extra.extend(queue_extra)
+                details.extend(queue_details)
+            if Resource.DASHBOARDS in selection.resources:
+                dash_extra, dash_details = await self._inventory_dashboards(raw["id"], selection)
+                extra.extend(dash_extra)
+                details.extend(dash_details)
+            parts.extend(extra)
             self.progress.message(f"  {raw['name']}: {', '.join(parts)}")
+            for line in details:
+                self.progress.message(line)
+
+    async def _inventory_evaluators(
+        self, source_project_id: str, selection: Selection
+    ) -> tuple[list[str], list[str]]:
+        evaluators = await self.source.evaluators(source_project_id)
+        scorer_count = 0
+        online_count = 0
+        details: list[str] = []
+        extra: list[str] = []
+        for evaluator in evaluators:
+            raw = as_dict(evaluator)
+            include_scorer = Resource.SCORERS in selection.resources and selected(
+                raw["name"], selection.scorers
+            )
+            include_online = Resource.ONLINE_EVALS in selection.resources and selected(
+                raw["name"], selection.online_evals
+            )
+            if not include_scorer and not include_online:
+                continue
+            definitions, scorer_skip = scorer_definitions(evaluator)
+            if include_scorer:
+                scorer_count += 1
+            function_ids = [f"dry-run-{index}" for index in range(len(definitions))]
+            _, online_skip = online_score_payload(evaluator, function_ids)
+            if include_online:
+                online_count += 1
+            kind = evaluator_type(evaluator) or "unknown"
+            scope = evaluator_scope(evaluator) or "n/a"
+            scorer_status = f"skipped — {scorer_skip}" if scorer_skip else "translate"
+            online_status = f"skipped — {online_skip}" if online_skip else "translate"
+            bits = []
+            if include_scorer:
+                bits.append(f"scorer {scorer_status}")
+            if include_online:
+                bits.append(f"online {online_status}")
+            details.append(f"    {raw['name']} ({kind}/{scope}): {', '.join(bits)}")
+        if Resource.SCORERS in selection.resources:
+            extra.append(f"{scorer_count} scorer(s)")
+        if Resource.ONLINE_EVALS in selection.resources:
+            extra.append(f"{online_count} online eval(s)")
+        return extra, details
+
+    async def _inventory_review_scores(self, selection: Selection) -> tuple[list[str], list[str]]:
+        definitions = [
+            item
+            for item in await self._all_feedback_definitions()
+            if selected(as_dict(item)["name"], selection.review_scores)
+        ]
+        details = []
+        for definition in definitions:
+            raw = as_dict(definition)
+            payload, skip = review_score_payload(definition)
+            status = f"skipped — {skip}" if skip else f"translate {payload['score_type']}"
+            details.append(f"    {raw['name']} ({raw.get('type') or 'unknown'}): {status}")
+        return [f"{len(definitions)} review score(s)"], details
+
+    async def _inventory_annotation_queues(
+        self, source_project_id: str, selection: Selection
+    ) -> tuple[list[str], list[str]]:
+        queues = [
+            item
+            for item in await self.source.annotation_queues(source_project_id)
+            if selected(as_dict(item)["name"], selection.annotation_queues)
+        ]
+        details = []
+        for queue in queues:
+            raw = as_dict(queue)
+            count = raw.get("items_count")
+            count_text = f"{count} item(s)" if count is not None else "items unknown"
+            names = raw.get("feedback_definition_names") or []
+            scores = f", scores {', '.join(names)}" if names else ""
+            details.append(
+                f"    {raw['name']} ({raw.get('scope') or 'trace'}): "
+                f"review view + flag {count_text}{scores}"
+            )
+        return [f"{len(queues)} annotation queue(s)"], details
+
+    async def _inventory_dashboards(
+        self, source_project_id: str, selection: Selection
+    ) -> tuple[list[str], list[str]]:
+        dashboards = [
+            item
+            for item in await self._listed_dashboards(source_project_id)
+            if selected(as_dict(item)["name"], selection.dashboards)
+        ]
+        details = []
+        for dashboard in dashboards:
+            raw = as_dict(dashboard)
+            _, skip, notes = dashboard_view_payload(dashboard)
+            kind = raw.get("type") or "unknown"
+            scope = raw.get("scope") or "workspace"
+            status = f"skipped — {skip}" if skip else "translate"
+            details.append(f"    {raw['name']} ({kind}/{scope}): {status}")
+            for note in notes:
+                details.append(f"      widget {note}")
+        return [f"{len(dashboards)} dashboard(s)"], details

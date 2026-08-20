@@ -24,6 +24,7 @@ def test_migration_is_the_top_level_bt_only_command() -> None:
     assert "--projects" in output
     assert "Commands" not in output
     assert "--writer" not in output
+    assert "--dashboards" in output
 
 
 def test_migrate_subcommand_is_not_accepted() -> None:
