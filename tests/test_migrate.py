@@ -794,7 +794,9 @@ async def test_dashboards_write_monitor_views_and_resume(tmp_path) -> None:
     assert len(target.view_writes) == 1
     _, payload = target.view_writes[0]
     assert payload["view_type"] == "monitor"
-    assert payload["view_data"]["custom_charts"][0]["measures"] == ["count(id)"]
+    charts = payload["view_data"]["custom_charts"]["charts"]
+    traces = charts["w-traces"]["definition"]["measures"]
+    assert traces == [{"btql": "id", "aggregator": {"type": "count"}}]
     assert checkpoint.completed("dashboard:project-1:dash-1")
 
 
@@ -844,6 +846,6 @@ async def test_dry_run_inventories_dashboard_widgets(tmp_path) -> None:
     assert "2 dashboard(s)" in joined
     assert "Prod overview (multi_project/workspace): translate" in joined
     assert "Eval board (experiments/workspace): skipped" in joined
-    assert "widget Trace volume: timeseries count(id)" in joined
+    assert "widget Trace volume: timeseries (1 measure(s))" in joined
     assert "markdown is not a Monitor chart" in joined
     assert "Custom charts require a Braintrust Pro or Enterprise plan" in joined

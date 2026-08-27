@@ -981,6 +981,8 @@ def review_flag_event(trace_id: str, queue: Any) -> dict[str, Any]:
     }
 
 
+MONITOR_CUSTOM_CHARTS_VERSION = "0.0.0"
+
 ROOT_SPAN_FILTER = "is_root"
 THREAD_SPAN_FILTER = "metadata.thread_id IS NOT NULL"
 LLM_SPAN_FILTER = "span_attributes.type = 'llm'"
@@ -1021,39 +1023,57 @@ def _and_sql(*parts: str | None) -> str | None:
     return " AND ".join(clauses) or None
 
 
-def _score_measure(name: str) -> str:
-    trimmed = name.strip()
-    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", trimmed):
-        return f"avg(scores.{trimmed})"
-    escaped = trimmed.replace("`", "``")
-    return f"avg(scores.`{escaped}`)"
+def _score_measure_configs(names: list[str]) -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "aggregateScore",
+            "scoreName": str(name).strip(),
+            "aggregator": {"type": "avg"},
+        }
+        for name in names
+        if str(name).strip()
+    ]
 
 
-def _percentile_measures(values: Any) -> list[str]:
-    measures = []
+def _percentile_measure_configs(values: Any) -> list[dict[str, Any]]:
+    measures: list[dict[str, Any]] = []
     for item in values or []:
         token = str(item).strip().lower().removeprefix("duration.")
         if token in {"avg", "average", "mean"}:
-            measures.append("avg(metrics.duration)")
+            measures.append({"btql": "metrics.duration", "aggregator": {"type": "avg"}})
             continue
         percentile = _DURATION_PERCENTILES.get(token)
         if percentile is None:
             continue
-        measures.append(f"percentile(metrics.duration, {percentile})")
+        measures.append(
+            {
+                "btql": "metrics.duration",
+                "aggregator": {"type": "percentile", "value": percentile},
+            }
+        )
     return measures or [
-        "percentile(metrics.duration, 0.5)",
-        "percentile(metrics.duration, 0.9)",
-        "percentile(metrics.duration, 0.99)",
+        {
+            "btql": "metrics.duration",
+            "aggregator": {"type": "percentile", "value": 0.5},
+        },
+        {
+            "btql": "metrics.duration",
+            "aggregator": {"type": "percentile", "value": 0.9},
+        },
+        {
+            "btql": "metrics.duration",
+            "aggregator": {"type": "percentile", "value": 0.99},
+        },
     ]
 
 
-def _usage_measures(values: Any, *, aggregator: str = "sum") -> list[str]:
-    measures = []
+def _usage_measure_configs(values: Any, *, aggregator: str = "sum") -> list[dict[str, Any]]:
+    measures: list[dict[str, Any]] = []
     for item in values or []:
         field = _USAGE_MEASURES.get(str(item).strip().lower())
         if field:
-            measures.append(f"{aggregator}({field})")
-    return measures or [f"{aggregator}(metrics.tokens)"]
+            measures.append({"btql": field, "aggregator": {"type": aggregator}})
+    return measures or [{"btql": "metrics.tokens", "aggregator": {"type": aggregator}}]
 
 
 def _dashboard_config(dashboard: Any) -> dict[str, Any]:
@@ -1081,31 +1101,84 @@ def _widget_title(widget: dict[str, Any]) -> str:
     return str(title).strip() or "Untitled widget"
 
 
-def _widget_chart(
-    widget: dict[str, Any],
+def _chart_id(widget: dict[str, Any]) -> str:
+    return str(widget.get("id") or _widget_title(widget))
+
+
+def _btql_filters(sql: str | None) -> list[dict[str, str]] | None:
+    if not sql:
+        return None
+    return [{"btql": sql}]
+
+
+def _btql_group_bys(field: str | None) -> list[dict[str, str]] | None:
+    if not field:
+        return None
+    return [{"btql": field}]
+
+
+def _monitor_timeseries_definition(
+    measures: list[dict[str, Any]],
     *,
-    chart_type: str,
-    measures: list[str],
-    visualization: str | None = None,
+    visualization: str,
     unit: str | None = None,
     span_filter: str | None = None,
     trace_filter: str | None = None,
     group_by: str | None = None,
 ) -> dict[str, Any]:
-    chart_id = str(widget.get("id") or _widget_title(widget))
+    viz: dict[str, Any] = {
+        "type": "timeseries",
+        "timeseriesVizType": "bars" if visualization == "bar" else "lines",
+    }
+    if unit:
+        viz["unitType"] = unit
     return compact(
         {
-            "id": chart_id,
-            "title": _widget_title(widget),
-            "chartType": chart_type,
-            "visualization": visualization,
-            "unit": unit,
+            "type": "monitorTimeseries",
             "measures": measures,
-            "spanFilter": span_filter,
-            "traceFilter": trace_filter,
-            "groupBy": group_by,
+            "filters": _btql_filters(span_filter),
+            "traceFilters": _btql_filters(trace_filter),
+            "groupBys": _btql_group_bys(group_by),
+            "viz": viz,
         }
     )
+
+
+def _monitor_scalars_definition(
+    measures: list[dict[str, Any]],
+    *,
+    unit: str | None = None,
+    span_filter: str | None = None,
+    trace_filter: str | None = None,
+) -> dict[str, Any]:
+    viz: dict[str, Any] = {"type": "singleValue"}
+    if unit:
+        viz["unitType"] = unit
+    return compact(
+        {
+            "type": "scalars",
+            "measures": measures,
+            "filters": _btql_filters(span_filter),
+            "traceFilters": _btql_filters(trace_filter),
+            "viz": viz,
+        }
+    )
+
+
+def _monitor_chart(
+    widget: dict[str, Any], definition: dict[str, Any]
+) -> tuple[str, dict[str, Any]]:
+    return _chart_id(widget), {"title": _widget_title(widget), "definition": definition}
+
+
+def _build_custom_charts(entries: list[tuple[str, dict[str, Any]]]) -> dict[str, Any]:
+    order = [chart_id for chart_id, _ in entries]
+    charts = {chart_id: config for chart_id, config in entries}
+    return {
+        "version": MONITOR_CUSTOM_CHARTS_VERSION,
+        "layout": {"type": "linear", "order": order},
+        "charts": charts,
+    }
 
 
 def _compile_widget_filters(
@@ -1143,7 +1216,7 @@ def _breakdown_group(config: dict[str, Any]) -> tuple[str | None, str | None]:
 
 def _translate_project_metrics(
     widget: dict[str, Any],
-) -> tuple[dict[str, Any] | None, str]:
+) -> tuple[tuple[str, dict[str, Any]] | None, str]:
     config = as_dict(widget.get("config") or {})
     metric = str(_cfg(config, "metric_type") or "TRACE_COUNT").strip().upper()
     chart_kind = str(_cfg(config, "chart_type") or "line").strip().lower()
@@ -1152,22 +1225,24 @@ def _translate_project_metrics(
     visualization = "bar" if chart_kind == "bar" else "line"
     extra_span = None
     unit = "count"
-    measures: list[str] = []
+    measures: list[dict[str, Any]] = []
     if metric == "TRACE_COUNT":
         extra_span = ROOT_SPAN_FILTER
-        measures = ["count(id)"]
+        measures = [{"btql": "id", "aggregator": {"type": "count"}}]
     elif metric == "SPAN_COUNT":
-        measures = ["count(id)"]
+        measures = [{"btql": "id", "aggregator": {"type": "count"}}]
     elif metric == "THREAD_COUNT":
         extra_span = THREAD_SPAN_FILTER
-        measures = ["count_distinct(metadata.thread_id)"]
+        measures = [
+            {"btql": "metadata.thread_id", "aggregator": {"type": "count_distinct"}}
+        ]
     elif metric in {"DURATION", "TRACE_DURATION", "SPAN_DURATION", "THREAD_DURATION"}:
         extra_span = {
             "DURATION": ROOT_SPAN_FILTER,
             "TRACE_DURATION": ROOT_SPAN_FILTER,
             "THREAD_DURATION": THREAD_SPAN_FILTER,
         }.get(metric)
-        measures = _percentile_measures(_cfg(config, "duration_metrics"))
+        measures = _percentile_measure_configs(_cfg(config, "duration_metrics"))
         unit = "duration"
     elif metric in {
         "TRACE_AVERAGE_DURATION",
@@ -1178,14 +1253,14 @@ def _translate_project_metrics(
             "TRACE_AVERAGE_DURATION": ROOT_SPAN_FILTER,
             "THREAD_AVERAGE_DURATION": THREAD_SPAN_FILTER,
         }.get(metric)
-        measures = ["avg(metrics.duration)"]
+        measures = [{"btql": "metrics.duration", "aggregator": {"type": "avg"}}]
         unit = "duration"
     elif metric in {"TOKEN_USAGE", "SPAN_TOKEN_USAGE"}:
         extra_span = ROOT_SPAN_FILTER if metric == "TOKEN_USAGE" else None
-        measures = _usage_measures(_cfg(config, "usage_metrics"))
+        measures = _usage_measure_configs(_cfg(config, "usage_metrics"))
     elif metric == "COST":
         extra_span = ROOT_SPAN_FILTER
-        measures = ["sum(metrics.estimated_cost)"]
+        measures = [{"type": "costByTrace"}]
         unit = "cost"
     elif metric in {"FEEDBACK_SCORES", "THREAD_FEEDBACK_SCORES", "SPAN_FEEDBACK_SCORES"}:
         extra_span = {
@@ -1199,10 +1274,10 @@ def _translate_project_metrics(
         ]
         if not names:
             return None, "skipped — feedback-score widget has no score names"
-        measures = [_score_measure(name) for name in names]
+        measures = _score_measure_configs(names)
     elif metric in {"TRACE_ERROR_RATE", "SPAN_ERROR_RATE"}:
         extra_span = ROOT_SPAN_FILTER if metric == "TRACE_ERROR_RATE" else None
-        measures = ["sum(metrics.errors) / count(id)"]
+        measures = [{"btql": "sum(metrics.errors) / count(id)"}]
         unit = "percent"
     elif metric == "GUARDRAILS_FAILED_COUNT":
         return None, "skipped — guardrail-failed count has no dedicated Monitor metric"
@@ -1214,58 +1289,63 @@ def _translate_project_metrics(
     group_by, group_error = _breakdown_group(config)
     if group_error:
         return None, f"skipped — {group_error}"
-    chart = _widget_chart(
+    chart = _monitor_chart(
         widget,
-        chart_type="timeseries",
-        measures=measures,
-        visualization=visualization,
-        unit=unit,
-        span_filter=span_filter,
-        trace_filter=trace_filter,
-        group_by=group_by,
+        _monitor_timeseries_definition(
+            measures,
+            visualization=visualization,
+            unit=unit,
+            span_filter=span_filter,
+            trace_filter=trace_filter,
+            group_by=group_by,
+        ),
     )
-    return chart, f"timeseries {' '.join(measures)}"
+    return chart, f"timeseries ({len(measures)} measure(s))"
 
 
-def _translate_stats_card(widget: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+def _translate_stats_card(widget: dict[str, Any]) -> tuple[tuple[str, dict[str, Any]] | None, str]:
     config = as_dict(widget.get("config") or {})
     metric = str(_cfg(config, "metric") or "trace_count").strip()
     source = str(_cfg(config, "source") or "traces").strip().lower()
     extra_span = ROOT_SPAN_FILTER if source != "spans" else None
     unit = "count"
-    measures: list[str]
+    measures: list[dict[str, Any]]
     lowered = metric.lower()
     if lowered in {"trace_count"}:
         extra_span = ROOT_SPAN_FILTER
-        measures = ["count(id)"]
+        measures = [{"btql": "id", "aggregator": {"type": "count"}}]
     elif lowered == "thread_count":
         extra_span = THREAD_SPAN_FILTER
-        measures = ["count_distinct(metadata.thread_id)"]
+        measures = [
+            {"btql": "metadata.thread_id", "aggregator": {"type": "count_distinct"}}
+        ]
     elif lowered == "span_count" and source == "spans":
         extra_span = None
-        measures = ["count(id)"]
+        measures = [{"btql": "id", "aggregator": {"type": "count"}}]
     elif lowered == "llm_span_count":
         extra_span = LLM_SPAN_FILTER
-        measures = ["count(id)"]
+        measures = [{"btql": "id", "aggregator": {"type": "count"}}]
     elif lowered in {"duration.p50", "duration.p90", "duration.p99"}:
-        measures = _percentile_measures([lowered])
+        measures = _percentile_measure_configs([lowered])
         unit = "duration"
     elif lowered == "total_estimated_cost_sum":
-        measures = ["sum(metrics.estimated_cost)"]
+        measures = [{"type": "costByTrace"}]
         unit = "cost"
     elif lowered == "total_estimated_cost":
-        measures = ["avg(metrics.estimated_cost)"]
+        measures = [{"btql": "metrics.estimated_cost", "aggregator": {"type": "avg"}}]
         unit = "cost"
     elif lowered in _USAGE_MEASURES:
-        measures = [f"avg({_USAGE_MEASURES[lowered]})"]
+        measures = [
+            {"btql": _USAGE_MEASURES[lowered], "aggregator": {"type": "avg"}}
+        ]
     elif lowered == "error_count":
         extra_span = _and_sql(extra_span, ERROR_SPAN_FILTER)
-        measures = ["count(id)"]
+        measures = [{"btql": "id", "aggregator": {"type": "count"}}]
     elif lowered.startswith("feedback_scores."):
         name = metric.split(".", 1)[1].strip()
         if not name:
             return None, "skipped — feedback-score card has no score name"
-        measures = [_score_measure(name)]
+        measures = _score_measure_configs([name])
     elif lowered == "guardrails_failed_count":
         return None, "skipped — guardrail-failed count has no dedicated Monitor metric"
     elif lowered in {"input", "output", "metadata", "tags", "span_count"}:
@@ -1275,18 +1355,19 @@ def _translate_stats_card(widget: dict[str, Any]) -> tuple[dict[str, Any] | None
     span_filter, trace_filter, error = _compile_widget_filters(config, extra_span)
     if error:
         return None, f"skipped — {error}"
-    chart = _widget_chart(
+    chart = _monitor_chart(
         widget,
-        chart_type="bignumber",
-        measures=measures,
-        unit=unit,
-        span_filter=span_filter,
-        trace_filter=trace_filter,
+        _monitor_scalars_definition(
+            measures,
+            unit=unit,
+            span_filter=span_filter,
+            trace_filter=trace_filter,
+        ),
     )
-    return chart, f"bignumber {' '.join(measures)}"
+    return chart, f"single-value ({len(measures)} measure(s))"
 
 
-def _translate_widget(widget: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+def _translate_widget(widget: dict[str, Any]) -> tuple[tuple[str, dict[str, Any]] | None, str]:
     kind = str(widget.get("type") or "").strip().lower()
     title = _widget_title(widget)
     if kind == "project_metrics":
@@ -1310,12 +1391,12 @@ def dashboard_view_payload(
     """Build a Braintrust Monitor view for an Opik production dashboard."""
     raw = jsonable(as_dict(dashboard))
     notes = []
-    charts = []
+    chart_entries: list[tuple[str, dict[str, Any]]] = []
     for widget in dashboard_widgets(dashboard):
         chart, note = _translate_widget(widget)
         notes.append(note)
         if chart is not None:
-            charts.append(chart)
+            chart_entries.append(chart)
     kind = str(raw.get("type") or "multi_project").strip().lower()
     scope = str(raw.get("scope") or "workspace").strip().lower()
     if scope == "insights":
@@ -1328,14 +1409,14 @@ def dashboard_view_payload(
         )
     if kind and kind != "multi_project":
         return None, f"dashboard type {kind!r} is not translated", notes
-    if not charts:
+    if not chart_entries:
         return None, "no translatable production widgets", notes
     return (
         {
             "name": str(raw.get("name") or "Opik dashboard"),
             "object_type": "project",
             "view_type": "monitor",
-            "view_data": {"custom_charts": charts},
+            "view_data": {"custom_charts": _build_custom_charts(chart_entries)},
             "options": {
                 "viewType": "monitor",
                 "options": {"type": "project", "spanType": "range", "rangeValue": "7d"},
