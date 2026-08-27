@@ -584,15 +584,27 @@ def test_production_dashboard_becomes_monitor_charts() -> None:
     payload, skip, notes = dashboard_view_payload(_dashboard())
     assert skip is None
     assert payload["view_type"] == "monitor"
-    charts = payload["view_data"]["custom_charts"]
-    assert [chart["chartType"] for chart in charts] == ["timeseries", "bignumber"]
-    traces, latency = charts
-    assert traces["measures"] == ["count(id)"]
-    assert traces["spanFilter"] == "is_root"
-    assert traces["traceFilter"] == "tags IN ('prod')"
-    assert traces["groupBy"] == "metadata.opik.model"
-    assert latency["measures"] == ["percentile(metrics.duration, 0.9)"]
-    assert latency["unit"] == "duration"
+    custom = payload["view_data"]["custom_charts"]
+    assert custom["version"] == "0.0.0"
+    order = custom["layout"]["order"]
+    charts = custom["charts"]
+    traces = charts[order[0]]
+    latency = charts[order[1]]
+    assert traces["definition"]["type"] == "monitorTimeseries"
+    assert latency["definition"]["type"] == "scalars"
+    assert traces["definition"]["measures"] == [
+        {"btql": "id", "aggregator": {"type": "count"}}
+    ]
+    assert traces["definition"]["filters"] == [{"btql": "is_root"}]
+    assert traces["definition"]["traceFilters"] == [{"btql": "tags IN ('prod')"}]
+    assert traces["definition"]["groupBys"] == [{"btql": "metadata.opik.model"}]
+    assert latency["definition"]["measures"] == [
+        {
+            "btql": "metrics.duration",
+            "aggregator": {"type": "percentile", "value": 0.9},
+        }
+    ]
+    assert latency["definition"]["viz"]["unitType"] == "duration"
     assert any("markdown is not a Monitor chart" in note for note in notes)
 
 
@@ -654,5 +666,14 @@ def test_experiment_radar_and_insights_dashboards_are_skipped() -> None:
         )
     )
     assert skip is None
-    measures = [chart["measures"] for chart in payload["view_data"]["custom_charts"]]
-    assert measures == [["sum(metrics.estimated_cost)"], ["avg(scores.Hallucination)"]]
+    charts = payload["view_data"]["custom_charts"]["charts"]
+    cost = charts["w-cost"]["definition"]["measures"]
+    scores = charts["w-scores"]["definition"]["measures"]
+    assert cost == [{"type": "costByTrace"}]
+    assert scores == [
+        {
+            "type": "aggregateScore",
+            "scoreName": "Hallucination",
+            "aggregator": {"type": "avg"},
+        }
+    ]

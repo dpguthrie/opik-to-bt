@@ -222,7 +222,18 @@ async def test_monitor_view_writes_inject_project_id(tmp_path) -> None:
         "name": "Prod overview",
         "object_type": "project",
         "view_type": "monitor",
-        "view_data": {"custom_charts": [{"id": "w-traces", "chartType": "timeseries"}]},
+        "view_data": {
+            "custom_charts": {
+                "version": "0.0.0",
+                "layout": {"type": "linear", "order": ["w-traces"]},
+                "charts": {
+                    "w-traces": {
+                        "title": "Traces",
+                        "definition": {"type": "monitorTimeseries", "measures": []},
+                    }
+                },
+            }
+        },
         "options": {
             "viewType": "monitor",
             "options": {"type": "project", "spanType": "range", "rangeValue": "7d"},

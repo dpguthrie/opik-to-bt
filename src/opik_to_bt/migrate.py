@@ -728,7 +728,7 @@ class Migrator:
         )
         self.checkpoint.mark_completed(completion_key)
         task = self.progress.start(f"dashboard · {raw['name']}")
-        self.progress.complete(task, items=len(payload["view_data"]["custom_charts"]), partitions=0)
+        self.progress.complete(task, items=len(payload["view_data"]["custom_charts"]["charts"]), partitions=0)
 
     async def _datasets(
         self, source_project_id: str, target_project_id: str, selection: Selection
